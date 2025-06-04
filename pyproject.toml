@@ -1,0 +1,59 @@
+[project]
+name = "latent-diffusion"
+version = "1.0.0"
+description = "Latent Diffusion implementation"
+authors = [
+  { name = "Bryan Anenberg", email = "anenbergb@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "einops", # tensor operations
+    "einx", # more general tensor operations
+    "jaxtyping",
+    "numpy",
+    "pytest",
+    "tiktoken",
+    "torch",
+    "tqdm",
+    "ruff",
+    "loguru",
+    "tensorboard",
+    "tabulate",
+    "humanfriendly",
+]
+
+[project.optional-dependencies]
+notebook = [
+  "jupyter",
+  "itkwidgets",
+  "jupyter_contrib_nbextensions",
+]
+dev = [
+  "ipdb",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ldm"]
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "WARNING"
+addopts = "-s"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.extend-per-file-ignores]
+# Also ignore `E402` in all `__init__.py` files.
+"__init__.py" = ["E402", "F401", "F403", "E501"]
+
+[tool.ruff.lint]
+extend-select = ["UP"]
+ignore = [
+    "F722"
+]
