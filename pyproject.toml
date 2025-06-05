@@ -21,6 +21,10 @@ dependencies = [
     "tensorboard",
     "tabulate",
     "humanfriendly",
+    "datasets",
+    "accelerate",
+    "fiftyone",
+    "diffusers"
 ]
 
 [project.optional-dependencies]
