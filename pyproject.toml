@@ -24,7 +24,12 @@ dependencies = [
     "datasets",
     "accelerate",
     "fiftyone",
-    "diffusers"
+    "transformers",
+    "diffusers",
+    "ninja",
+    "triton>=3.3.1",
+    "lpips",
+    "taming_transformers"
 ]
 
 [project.optional-dependencies]
