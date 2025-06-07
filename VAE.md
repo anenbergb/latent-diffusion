@@ -114,3 +114,87 @@ $$
 - **Adversarial Loss (PatchGAN Discriminator)**  
   A discriminator network classifies image patches as real or fake.  
   This loss sharpens outputs by forcing the decoder to generate more realistic textures and fine details.
+
+### Network Architecture
+```
+Input (B, 3, 256, 256)
+│
+▼
+Conv2d(3 → 128, 3x3) (B,128,256,256)
+│
+▼
+╔══════════════════════════════╗
+║ DownEncoderBlock2D × 4       ║
+║ ┌──────────────────────────┐ ║
+║ │ ResnetBlock2D × 2        │ ║
+║ │ (with GroupNorm, SiLU)   │ ║
+║ └──────────────────────────┘ ║
+║ ┌──────────────────────────┐ ║
+║ │ Downsample2D (stride=2)  │ ║
+║ └──────────────────────────┘ ║
+╚══════════════════════════════╝
+│ [ -> (B,128,128,128) -> (B,256,64,64) -> (B,512,32,32) -> (B,512,32,32) ]
+| 
+▼
+╔══════════════════════════════╗
+║ UNetMidBlock2D               ║
+║ ┌──────────────────────────┐ ║
+║ │ ResnetBlock2D            │ ║
+║ │ Self-Attention           │ ║
+║ │ ResnetBlock2D            │ ║
+║ └──────────────────────────┘ ║
+╚══════════════════════════════╝
+│ (B,512,32,32)
+▼
+GroupNorm → SiLU → Conv2d(512 → 8)
+│ (B,8,32,32)
+▼
+QuantConv 1×1 (8 → 8)
+│ (B,8,32,32)
+▼
+Sample from Diagonal Gaussian
+│ (B,4,32,32)
+▼
+PostQuantConv 1×1 (4 → 4)
+│ (B,4,32,32)
+▼
+Conv2d(4 → 512, 3x3)
+│ (B,512,32,32)
+▼
+╔══════════════════════════════╗
+║ UNetMidBlock2D               ║
+║ ┌──────────────────────────┐ ║
+║ │ ResnetBlock2D            │ ║
+║ │ Self-Attention           │ ║
+║ │ ResnetBlock2D            │ ║
+║ └──────────────────────────┘ ║
+╚══════════════════════════════╝
+│ (B,512,32,32)
+▼
+╔══════════════════════════════╗
+║ UpDecoderBlock2D × 4         ║
+║ ┌──────────────────────────┐ ║
+║ │ ResnetBlock2D × 3        │ ║
+║ │ (with GroupNorm, SiLU)   │ ║
+║ └──────────────────────────┘ ║
+║ ┌──────────────────────────┐ ║
+║ │ Upsample2D (Conv + Interp)│ ║
+║ └──────────────────────────┘ ║
+╚══════════════════════════════╝
+│
+▼
+
+│
+▼
+GroupNorm → SiLU → Conv2d(128 → 3)
+│
+▼
+Reconstructed Image (B, 3, 256, 256)
+```
+### Sampling Latent Tensor
+Given an input image of shape `(N,3,256,256)` the VAE encoder predicts mean and logvar tensors of shape `(N,4,32,32)` that define a Diagonal Gaussian Distribution. The standard deviation (std) can be computed from the logvar by `std = torch.exp(0.5 * logvar)`.
+A latent embedding tensor of shape `(N,4,32,32)` can be sampled from this gaussian distribution with the following code
+```python
+sample = torch.randn_like(self.mean)
+x = mean + std * sample
+```
