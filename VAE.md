@@ -34,7 +34,7 @@ A **KL VAE** is a variational autoencoder that learns a continuous latent space 
 whereas a **VQ-GAN  (Vector-Quantized Generative Adversarial Network)** encodes inputs into a discrete latent space 
 (grid of codebook indices) using vector quantization and enhances reconstruction quality with adversarial (GAN) training. 
 
-**In the [Latent Diffusion paper (2022)](https://arxiv.org/abs/2112.10752)**, VQ-GAN was used as the first-stage autoencoder because:
+In the [Latent Diffusion paper](https://arxiv.org/abs/2112.10752), VQ-GAN was used as the first-stage autoencoder because:
 
 - It provided a **discrete, compressed latent space**, enabling efficient diffusion modeling.
 - The **adversarial training** improved the sharpness and realism of reconstructions.
@@ -88,7 +88,20 @@ The KL-F8 VAE is trained using a combination of losses:
 
 - **KL Divergence Loss**  
   Encourages the latent distribution to follow a unit Gaussian (`N(0, I)`), enabling smooth and continuous sampling.  
-  Helps regularize the latent space and stabilizes training.
+  Helps regularize the latent space and stabilizes training. The latent distribution is diagonal, so there is no covariance between dimensions.
+  
+The KL divergence between two diagonal Gaussian distributions
+- $q(z) = \mathcal{N}(\mu_1, \sigma_1^2)$  
+- $p(z) = \mathcal{N}(\mu_2, \sigma_2^2)$
+
+$$ D_{KL}(q \parallel p) = \frac{1}{2} \sum_i \left( \frac{(\mu_1 - \mu_2)^2}{\sigma_2^2} + \frac{\sigma_1^2}{\sigma_2^2} - 1 + \log \left( \frac{\sigma_2^2}{\sigma_1^2} \right) \right) $$
+
+and in the special case of $p(z) = \mathcal{N}(0, 1)$
+
+$$
+D_{KL}\left( \mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(0, 1) \right) =
+\frac{1}{2} \sum_i \left( \mu_i^2 + \sigma_i^2 - 1 - \log \sigma_i^2 \right)
+$$
 
 - **LPIPS Loss (Learned Perceptual Image Patch Similarity)**  
   Measures perceptual similarity using deep features extracted from a pretrained network (e.g., VGG).  
