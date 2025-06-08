@@ -218,9 +218,77 @@ rec_loss = F.mse_loss(reconstructions, targets)
 
 #### Adversarial Loss (PatchGAN Discriminator)
 - A discriminator network classifies image patches as real or fake.
-This loss sharpens outputs by forcing the decoder to generate more realistic textures and fine details.
+- This loss sharpens outputs by forcing the decoder to generate more realistic textures and fine details.
 - Discriminator loss isn't added to training until 50k iterations.
-- hing_loss 
+
+The [taming-transformers](https://github.com/CompVis/taming-transformers) `NLayerDiscriminator` (PatchGAN as in Pix2Pix) is used.
+```
+(N,3,256,256)
+|
+▼
+Conv2d 4x4 stride=2 (3 → 64), LeakyReLU
+| (N,64,128,128)
+▼
+Conv2d 4x4 stride=2 (64 → 128), BatchNorm2d, LeakyReLU
+| (N,128,64,64)
+▼
+Conv2d 4x4 stride=2 (128 → 256), BatchNorm2d, LeakyReLU
+| (N,256,32,32)
+▼
+Conv2d 4x4 stride=1 (256 → 512), BatchNorm2d, LeakyReLU
+| (N,512,31,31)
+▼
+Conv2d 4x4 stride=1 (512 → 1)
+| 
+▼
+(N,1,30,30)
+```
+
+The discriminator is applied to the VAE-generated image reconstruction to encourage the VAE to generate outputs that
+fool the discriminator. E.g. the VAE wants `logits_fake` to be positive, which indicates that the discriminator thinks the reconstructed image is real.
+```python
+logits_fake = discriminator(reconstructions)
+g_loss = -torch.mean(logits_fake)
+```
+The discriminator loss is balanced with the l2-reconstruction and lpips loss by rescaling according to the gradient norms.
+```python
+nll_loss = rec_loss + p_scale * p_loss`
+nll_grads = grad(nll_loss, last_layer)
+g_grads = grad(g_loss, last_layer)
+disc_weight = norm(nll_grads) / (norm(g_grads) + 1e-4)
+```
+#### Final Loss
+```python
+p_scale = 0.5
+kl_scale = 1e-6
+loss = rec_loss + p_scale * p_loss + kl_scale * kl_loss + disc_weight * g_loss
+```
+### Training the Discriminator
+- Discriminator training only begins after 50k iterations
+- On alternating steps, either the VAE is updated or the discriminator is updated.
+- The discriminator to trained to distinguish real from reconstructed images.
+```python
+logits_real = discriminator(targets)
+logits_fake = discriminator(reconstructions)
+d_loss = disc_loss(logits_real, logits_fake)
+```
+- Uses either hinge loss or vanilla GAN loss.
+
+**Hinge Loss**
+-  commonly used in modern GANs (e.g., BigGAN, StyleGAN2). It's known for improved training stability and sharper outputs.
+-  Encourages margin between real and fake logits
 
 
-scale_factor: 1.0
+<img src="https://github.com/user-attachments/assets/cd52bad3-abae-4fb4-8be6-0f7112876d96" width="500"/>
+
+
+**Vanilla GAN loss**
+- original GAN loss proposed in the Goodfellow et al. paper (2014)
+- Encourages D(x) → 1 for real, D(𝑥̃) → 0 for fake.
+
+<img src="https://github.com/user-attachments/assets/95d46a50-66b7-47f3-9a32-aaa7122a2740" width="450"/>
+
+| Loss Type       | Discriminator Loss                                                  | Generator Loss                          | Discriminator Output |
+|------------------|---------------------------------------------------------------------|------------------------------------------|------------------------|
+| **Hinge**         | `max(0, 1 - D(x_real)) + max(0, 1 + D(x_fake))`                    | `-D(x_fake)`                             | Raw scores (logits)    |
+| **Vanilla GAN**   | `-log(D(x_real)) - log(1 - D(x_fake))`                             | `-log(D(x_fake))`                        | Probabilities (0–1)    |
