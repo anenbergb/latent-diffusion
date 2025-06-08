@@ -82,39 +82,6 @@ making it one of the best-performing and most efficient autoencoders evaluated.
 - **Decoder**: Symmetric upsampling CNN with skip connections  
 - **Attention layers**: Optional self-attention at intermediate resolutions (e.g., 64×64)
 
-### KL-VAE Training Losses
-
-The KL-F8 VAE is trained using a combination of losses:
-
-- **KL Divergence Loss**  
-  Encourages the latent distribution to follow a unit Gaussian (`N(0, I)`), enabling smooth and continuous sampling.  
-  Helps regularize the latent space and stabilizes training. The latent distribution is diagonal, so there is no covariance between dimensions.
-  
-The KL divergence between two diagonal Gaussian distributions
-- $q(z) = \mathcal{N}(\mu_1, \sigma_1^2)$  
-- $p(z) = \mathcal{N}(\mu_2, \sigma_2^2)$
-
-$$ D_{KL}(q \parallel p) = \frac{1}{2} \sum_i \left( \frac{(\mu_1 - \mu_2)^2}{\sigma_2^2} + \frac{\sigma_1^2}{\sigma_2^2} - 1 + \log \left( \frac{\sigma_2^2}{\sigma_1^2} \right) \right) $$
-
-and in the special case of $p(z) = \mathcal{N}(0, 1)$
-
-$$
-D_{KL}\left( \mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(0, 1) \right) =
-\frac{1}{2} \sum_i \left( \mu_i^2 + \sigma_i^2 - 1 - \log \sigma_i^2 \right)
-$$
-
-- **LPIPS Loss (Learned Perceptual Image Patch Similarity)**  
-  Measures perceptual similarity using deep features extracted from a pretrained network (e.g., VGG).  
-  Encourages reconstructions that *look* closer to the input from a human visual perspective, even if pixel values differ.
-
-- **L2 (Reconstruction) Loss**  
-  Penalizes pixel-wise differences between the input and reconstruction.  
-  Ensures structural accuracy but can lead to blurry outputs if used alone.
-
-- **Adversarial Loss (PatchGAN Discriminator)**  
-  A discriminator network classifies image patches as real or fake.  
-  This loss sharpens outputs by forcing the decoder to generate more realistic textures and fine details.
-
 ### Network Architecture
 ```
 Input (B, 3, 256, 256)
@@ -188,6 +155,7 @@ GroupNorm → SiLU → Conv2d(128 → 3)
 ▼
 Reconstructed Image (B, 3, 256, 256)
 ```
+
 ### Sampling Latent Tensor
 Given an input image of shape `(N,3,256,256)` the VAE encoder predicts mean and logvar tensors of shape `(N,4,32,32)` that define a Diagonal Gaussian Distribution. The standard deviation (std) can be computed from the logvar by `std = torch.exp(0.5 * logvar)`.
 A latent embedding tensor of shape `(N,4,32,32)` can be sampled from this gaussian distribution with the following code
@@ -195,3 +163,64 @@ A latent embedding tensor of shape `(N,4,32,32)` can be sampled from this gaussi
 sample = torch.randn_like(self.mean)
 x = mean + std * sample
 ```
+
+### KL-VAE Training Losses
+
+The KL-F8 VAE is trained using a combination of losses:
+
+#### KL Divergence Loss
+- Encourages the latent distribution to follow a unit Gaussian (`N(0, I)`), enabling smooth and continuous sampling.  
+- Helps regularize the latent space and stabilizes training.
+- The latent distribution is diagonal, so there is no covariance between dimensions.
+
+The VAE encoder predicts mean and logvar of shape `(N,4,32,32)` from which you can define
+```python
+std = torch.exp(0.5 * logvar)
+var = torch.exp(logvar)
+```
+
+The KL divergence between two diagonal Gaussian distributions
+- $q(z) = \mathcal{N}(\mu_1, \sigma_1^2)$  
+- $p(z) = \mathcal{N}(\mu_2, \sigma_2^2)$
+
+$$ D_{KL}(q \parallel p) = \frac{1}{2} \sum_i \left( \frac{(\mu_1 - \mu_2)^2}{\sigma_2^2} + \frac{\sigma_1^2}{\sigma_2^2} - 1 + \log \left( \frac{\sigma_2^2}{\sigma_1^2} \right) \right) $$
+
+and in the special case of $p(z) = \mathcal{N}(0, 1)$
+
+$$
+D_{KL}\left( \mathcal{N}(\mu, \sigma^2) \,\|\, \mathcal{N}(0, 1) \right) =
+\frac{1}{2} \sum_i \left( \mu_i^2 + \sigma_i^2 - 1 - \log \sigma_i^2 \right)
+$$
+
+which can be expressed in python as
+```python
+kl_loss = 0.5 * torch.sum(torch.pow(mean, 2) + var - 1.0 - logvar, dim=[1, 2, 3])
+```
+scale_factor: 1e-6
+
+#### LPIPS Loss (Learned Perceptual Image Patch Similarity)
+  Measures perceptual similarity using deep features extracted from a pretrained network (e.g., VGG).  
+  Encourages reconstructions that *look* closer to the input from a human visual perspective, even if pixel values differ.
+
+We use `lpips` package https://github.com/richzhang/PerceptualSimilarity
+```python
+perceptual_loss = lpips.LPIPS(net="vgg").eval()
+p_loss = perceptual_loss(reconstructions, targets)
+```
+scale_factor: 0.5
+
+#### L2 (Reconstruction) Loss
+  Penalizes pixel-wise differences between the input and reconstruction.  
+  Ensures structural accuracy but can lead to blurry outputs if used alone.
+```python
+rec_loss = F.mse_loss(reconstructions, targets)
+```
+
+#### Adversarial Loss (PatchGAN Discriminator)
+- A discriminator network classifies image patches as real or fake.
+This loss sharpens outputs by forcing the decoder to generate more realistic textures and fine details.
+- Discriminator loss isn't added to training until 50k iterations.
+- hing_loss 
+
+
+scale_factor: 1.0
