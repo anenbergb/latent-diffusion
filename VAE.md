@@ -1,4 +1,4 @@
-# Training the VAE
+# Variational Autoencoder
 
 <img src="https://github.com/user-attachments/assets/ad5eadf5-15cd-4c62-a991-a109066618a9" width="500"/>
 
@@ -292,3 +292,18 @@ d_loss = disc_loss(logits_real, logits_fake)
 |------------------|---------------------------------------------------------------------|------------------------------------------|------------------------|
 | **Hinge**         | `max(0, 1 - D(x_real)) + max(0, 1 + D(x_fake))`                    | `-D(x_fake)`                             | Raw scores (logits)    |
 | **Vanilla GAN**   | `-log(D(x_real)) - log(1 - D(x_fake))`                             | `-log(D(x_fake))`                        | Probabilities (0–1)    |
+
+## Training the VAE
+The VAE can be trained using the [train_autoencoder.py](ldm/tools/train_autoencoder.py) script that was adopted from [diffusers/autoencoderkl](https://github.com/huggingface/diffusers/tree/main/examples/research_projects/autoencoderkl).
+
+The exact training recipe for the `KL F-8 VAE` from the [Latent Diffusion paper](https://arxiv.org/abs/2112.10752) is unclear, 
+but we suspect it was trained
+- on [OpenImages dataset](https://storage.googleapis.com/openimages/web/index.html), which is a very large labeled image dataset, that has since increased since the LDM paper publication. 
+- with batch size = 192 on 16x V100 GPUs for ~250k iterations
+
+The original `KL F-8 VAE` was later fine-tuned with a 1:1 ratio on 
+[LAION-Aesthetics](https://laion.ai/blog/laion-aesthetics/) and  LAION-Humans datasets and 
+published to [Huggingface sd-vae-ft-mse](https://huggingface.co/stabilityai/sd-vae-ft-mse).
+The training batch size = 192 on 16x A100s (batch size = 12 per GPU)
+
+OpenImages V7 can be [downloaded from FiftyOne](https://docs.voxel51.com/dataset_zoo/datasets.html#open-images-v7)
