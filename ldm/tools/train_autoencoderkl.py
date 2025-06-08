@@ -925,6 +925,7 @@ def main(args):
             latents = posterior.sample()
             reconstructions = accelerator.unwrap_model(vae).decode(latents).sample
 
+            # Train VAE with optional adversarial guidance
             if (step // args.gradient_accumulation_steps) % 2 == 0 or global_step < args.disc_start:
                 with accelerator.accumulate(vae):
                     # reconstruction loss. Pixel level differences between input vs output
