@@ -29,7 +29,8 @@ dependencies = [
     "ninja",
     "triton>=3.3.1",
     "lpips",
-    "taming_transformers"
+    "taming_transformers",
+    "img2dataset"
 ]
 
 [project.optional-dependencies]
