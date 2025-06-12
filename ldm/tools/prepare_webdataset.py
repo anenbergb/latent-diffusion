@@ -1,40 +1,27 @@
 #!/usr/bin/env python3
 """prepare_webdataset.py
 
-Convert PNG/JSON pairs into **WebDataset** shards that contain
+Convert PNG/JSON pairs into **WebDataset** shards.  Each output record
+contains:
 
-* ``<key>.jpg`` - RGB JPEG (quality 95, resized so the shortest side == ``--image_size``)
-* ``<key>.json`` - one JSON blob with all metadata
+* ``<key>.jpg`` - RGB JPEG (quality set by ``--jpeg_quality``)
+* ``<key>.json`` - consolidated metadata (url, caption, sha256, dimensions)
 
-The JSON schema written per sample:
-
-```jsonc
-{
-  "url": "…",               // from original metadata
-  "caption": "…",           // from original metadata
-  "sha256": "…",           // from original metadata
-  "width": 512,              // resized dimensions
-  "height": 768,
-  "original_width": 1024,    // dimensions before resize
-  "original_height": 1536
-}
-```
-
-Because WebDataset chooses an encoder based on the *extension* of each sample
-field, we bundle every numeric dimension into the JSON payload instead of
-keeping standalone keys like ``width``. Passing bare integers would trigger
-``ValueError: no handler found for width``.
+Highlights
+~~~~~~~~~~
+* Strips oversized XMP/XML chunks so Pillow never raises
+  ``ValueError: XMP data is too long``.
+* JPEG quality is now configurable via **command-line** (``--jpeg_quality``),
+  defaulting to **95**.
 
 Usage example
 -------------
-
 ```bash
 python prepare_webdataset.py \
   --input_dirs 00000 00001 \
   --output_dir shards \
-  --maxcount 100000 \
-  --maxsize 20000000000 \
-  --image_size 256
+  --image_size 256 \
+  --jpeg_quality 90
 ```
 
 Dependencies
@@ -56,61 +43,69 @@ from PIL import Image
 from loguru import logger
 import webdataset as wds
 
-__all__ = [
-    "build_data_paths",
-    "process_sample",
-    "write_shards",
-]
-
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
 
 def build_data_paths(input_dirs: Iterable[str]) -> List[Tuple[Path, Path]]:
-    """Return list of (png, json) `Path` pairs discovered under *input_dirs*."""
+    """Return list of (png, json) path tuples discovered under *input_dirs*."""
     pairs: List[Tuple[Path, Path]] = []
-    for input_dir in input_dirs:
-        for png in sorted(Path(input_dir).rglob("*.png")):
-            j = png.with_suffix(".json")
-            if j.exists():
-                pairs.append((png, j))
+    for directory in input_dirs:
+        for png in sorted(Path(directory).rglob("*.png")):
+            meta_path = png.with_suffix(".json")
+            if meta_path.exists():
+                pairs.append((png, meta_path))
             else:
-                logger.warning("Missing JSON for {} – skipping", png)
+                logger.warning("Missing JSON for {} - skipping", png)
     logger.info("Indexed {} PNG/JSON pairs from {} folders", len(pairs), len(input_dirs))
     return pairs
 
 
 def resize_image(img: Image.Image, image_size: int) -> Image.Image:
-    """Return *img* resized with Lanczos so its shortest side == *image_size*."""
+    """Resize *img* so its shortest side equals *image_size* using Lanczos."""
     w, h = img.size
-    ratio = image_size / float(min(w, h))
-    new_size = (round(w * ratio), round(h * ratio))
+    scale = image_size / float(min(w, h))
+    new_size = (round(w * scale), round(h * scale))
     return img.resize(new_size, resample=Image.LANCZOS)
 
 
-def process_sample(png_path: Path, json_path: Path, image_size: int, jpeg_quality: int = 95) -> dict | None:
-    """Convert one PNG/JSON pair into a WebDataset *sample* dict."""
-    try:
-        # ---------- metadata ------------
-        with json_path.open("r", encoding="utf-8") as f:
-            meta = json.load(f)
+def strip_problematic_metadata(pil_img: Image.Image) -> None:
+    """Remove XMP/XML blocks that exceed JPEG limits."""
+    for key in ("xmp", "xml"):
+        if key in pil_img.info:
+            pil_img.info.pop(key, None)
 
-        # ---------- image ---------------
-        with Image.open(png_path) as im:
-            im = im.convert("RGB")
-            orig_w, orig_h = im.size
-            im = resize_image(im, image_size)
-            resized_w, resized_h = im.size
+
+def process_sample(
+    png_path: Path,
+    json_path: Path,
+    image_size: int,
+    jpeg_quality: int,
+) -> dict | None:
+    """Convert one PNG/JSON pair into a WebDataset sample dict."""
+    try:
+        # --- load metadata --------------------------------------------------
+        with json_path.open("r", encoding="utf-8") as f:
+            meta_in = json.load(f)
+
+        # --- process image --------------------------------------------------
+        with Image.open(png_path) as img:
+            img = img.convert("RGB")
+            orig_w, orig_h = img.size
+            img = resize_image(img, image_size)
+            resized_w, resized_h = img.size
+
+            strip_problematic_metadata(img)
 
             buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)  # quality 95
+            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
             jpg_bytes = buf.getvalue()
 
-        # ---------- merge metadata ------
+        # --- merge + encode metadata ---------------------------------------
         meta_out = {
-            "url": meta.get("url", ""),
-            "caption": meta.get("caption", ""),
-            "sha256": meta.get("sha256", ""),
+            "url": meta_in.get("url", ""),
+            "caption": meta_in.get("caption", ""),
+            "sha256": meta_in.get("sha256", ""),
             "width": resized_w,
             "height": resized_h,
             "original_width": orig_w,
@@ -118,32 +113,35 @@ def process_sample(png_path: Path, json_path: Path, image_size: int, jpeg_qualit
         }
         json_bytes = json.dumps(meta_out, ensure_ascii=False).encode("utf-8")
 
-        key = str(meta.get("key", png_path.stem))
-        sample = {
-            "__key__": key,
-            "jpg": jpg_bytes,
-            "json": json_bytes,
-        }
-        return sample
+        key = str(meta_in.get("key", png_path.stem))
+        return {"__key__": key, "jpg": jpg_bytes, "json": json_bytes}
+
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("Failed to process {}: {}", png_path, exc)
         return None
 
 
-def write_shards(pairs: List[Tuple[Path, Path]], output_dir: str, *,
-                 maxcount: int, maxsize: int, image_size: int, jpeg_quality: int = 95) -> None:
-    """Write all *pairs* into shard files under *output_dir*."""
-    out_dir = Path(output_dir);
+def write_shards(
+    pairs: List[Tuple[Path, Path]],
+    output_dir: str,
+    *,
+    maxcount: int,
+    maxsize: int,
+    image_size: int,
+    jpeg_quality: int,
+) -> None:
+    """Stream *pairs* into shard files under *output_dir*."""
+    out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(out_dir / "%05d.tar")
 
     with wds.ShardWriter(pattern, maxcount=maxcount, maxsize=maxsize) as sink:
-        for i, (png, js) in enumerate(pairs, 1):
-            s = process_sample(png, js, image_size, jpeg_quality=jpeg_quality)
-            if s:
-                sink.write(s)
-            if i % 10_000 == 0:
-                logger.info("Processed {}/{} samples", i, len(pairs))
+        for idx, (png, meta) in enumerate(pairs, 1):
+            sample = process_sample(png, meta, image_size, jpeg_quality)
+            if sample:
+                sink.write(sample)
+            if idx % 10_000 == 0:
+                logger.info("Processed {}/{} samples", idx, len(pairs))
     logger.success("All shards written to {}", out_dir)
 
 # ---------------------------------------------------------------------------
@@ -151,40 +149,50 @@ def write_shards(pairs: List[Tuple[Path, Path]], output_dir: str, *,
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Prepare WebDataset shards from PNG/JSON pairs")
-    p.add_argument("--input_dirs", nargs="+", required=True,
-                   help="One or more directories containing PNG/JSON files")
-    p.add_argument("--output_dir", required=True,
-                   help="Directory where *.tar shards will be written")
-    p.add_argument("--maxcount", type=int, default=100_000,
-                   help="Max records per shard (default: 100000)")
-    p.add_argument("--maxsize", type=float, default=20e9,
-                   help="Max shard size in bytes (default: 20e9 ≈ 20 GB)")
-    p.add_argument("--image_size", type=int, default=256,
-                   help="Resize shortest side to this many pixels (default: 256)")
-    p.add_argument("--log_level", default="INFO",
-                   help="Logging level for loguru (default: INFO)")
-    p.add_argument("--jpeg_quality", type=int, default=95,
-                   help="JPEG quality for saved images (default: 95)")
-    return p.parse_args(argv)
+    parser = argparse.ArgumentParser(description="Prepare WebDataset shards from PNG/JSON pairs")
+    parser.add_argument("--input_dirs", nargs="+", required=True,
+                        help="Directories containing PNG/JSON files")
+    parser.add_argument("--output_dir", required=True,
+                        help="Directory where *.tar shards will be written")
+    parser.add_argument("--maxcount", type=int, default=100_000,
+                        help="Max records per shard (default: 100000)")
+    parser.add_argument("--maxsize", type=float, default=20e9,
+                        help="Max shard size in bytes (default: 20e9 ≈ 20 GB)")
+    parser.add_argument("--image_size", type=int, default=256,
+                        help="Resize shortest side to this many pixels (default: 256)")
+    parser.add_argument("--jpeg_quality", type=int, default=95,
+                        help="JPEG quality (1-100, default: 95)")
+    parser.add_argument("--log_level", default="INFO",
+                        help="loguru log level (default: INFO)")
+    return parser.parse_args(argv)
 
 
 def main(argv: List[str] | None = None) -> None:
-    a = parse_args(argv)
+    args = parse_args(argv)
+
+    # Clamp quality into Pillow's valid range 1-100.
+    jpeg_q = max(1, min(100, args.jpeg_quality))
+    if jpeg_q != args.jpeg_quality:
+        logger.warning("Clamped --jpeg_quality to {} (valid range is 1-100)", jpeg_q)
+
+    # Configure loguru
     logger.remove()
-    logger.add(sys.stderr, level=a.log_level.upper(),
+    logger.add(sys.stderr, level=args.log_level.upper(),
                format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
 
-    pairs = build_data_paths(a.input_dirs)
+    pairs = build_data_paths(args.input_dirs)
     if not pairs:
-        logger.error("No PNG/JSON pairs found – exiting")
+        logger.error("No PNG/JSON pairs found - exiting")
         sys.exit(1)
 
-    write_shards(pairs, a.output_dir,
-                 maxcount=a.maxcount,
-                 maxsize=int(a.maxsize),
-                 image_size=a.image_size,
-                 jpeg_quality=a.jpeg_quality)
+    write_shards(
+        pairs,
+        output_dir=args.output_dir,
+        maxcount=args.maxcount,
+        maxsize=int(args.maxsize),
+        image_size=args.image_size,
+        jpeg_quality=jpeg_q,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
