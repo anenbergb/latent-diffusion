@@ -4,13 +4,14 @@ import random
 import math
 from pathlib import Path
 from contextlib import nullcontext
+import sys
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from tqdm.auto import tqdm
-from loguru import logger
+import logging
 from braceexpand import braceexpand
 import webdataset as wds
 
@@ -36,14 +37,26 @@ def parse_args():
 
     # --- model & data ------------------------------------------------------- #
     parser.add_argument(
-        "--pretrained_model_name_or_path",
+        "--pretrained_clip",
+        type=str,
+        default="laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
+        help="HF path to pretrained CLIP model (text encoder). Options could include "
+        "'openai/clip-vit-large-patch14', 'laion/CLIP-ViT-L-14-laion2B-s32B-b82K', 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K'",
+    )
+    parser.add_argument(
+        "--pretrained_vae",
+        type=str,
+        default="stabilityai/sd-vae-ft-mse",
+        help="HF path to pretrained VAE model (image encoder/decoder). Options could include "
+        "'stabilityai/sd-vae-ft-mse' which was used in stable diffusion v1.4 and works with input resolutions or 256x256 and 512x512."
+    )
+    parser.add_argument(
+        "--pretrained_denoiser",
         type=str,
         required=True,
-        help="HF path or local dir of a Stable-Diffusion base model.",
+        help="HF path or local path to pretrained latent denoising model, e.g. the U-Net or DiT. "
+        "For stable diffusion use 'CompVis/stable-diffusion-v1-4'"
     )
-    parser.add_argument("--revision", type=str, default=None, help="Optional model revision.")
-    parser.add_argument("--variant", type=str, default=None, help="Optional model variant (e.g. fp16).")
-
     parser.add_argument(
         "--dataset_tar_specs",
         type=str,
@@ -106,10 +119,8 @@ def parse_args():
     )
     parser.add_argument("--noise_offset", type=float, default=0.0, help="Add offset noise (CrossLabs blog).")
     parser.add_argument("--input_perturbation", type=float, default=0.0, help="Extra noise perturbation factor.")
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="Enable PyTorch grad-checkpointing.")
     parser.add_argument("--use_8bit_adam", action="store_true", help="Use bitsandbytes 8-bit AdamW.")
     parser.add_argument("--use_ema", action="store_true", help="Maintain EMA of UNet params.")
-    parser.add_argument("--offload_ema", action="store_true", help="Offload EMA params to CPU between updates.")
     parser.add_argument("--foreach_ema", action="store_true", help="Use foreach-based EMA update (faster).")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Enable xformers.")
 
@@ -207,14 +218,14 @@ def collate_fn(batch):
 # --------------------------------------------------------------------------- #
 # Validation util
 # --------------------------------------------------------------------------- #
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, step):
+def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step):
     logger.info(f"Running validation at step {step}...")
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        unet=unet,
+        denoiser=denoiser,
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
@@ -244,8 +255,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
-    args = parse_args()
+def train_ldm(args):
 
     # Seed / dirs
     if args.seed is not None:
@@ -253,8 +263,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Logging
-    logger.remove()
-    logger.add(lambda msg: tqdm.write(msg, end=""), colorize=True)
+    logger = logging.getLogger(__name__)
     logger.info(f"Output dir → {args.output_dir}")
 
     # Accelerate setup
@@ -275,34 +284,34 @@ def main():
     accelerator.init_trackers(os.path.basename(args.output_dir))
 
     # Models
-    sd_path = args.pretrained_model_name_or_path
-    noise_scheduler = DDPMScheduler.from_pretrained(sd_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(sd_path, subfolder="tokenizer", revision=args.revision)
-    text_encoder = CLIPTextModel.from_pretrained(sd_path, subfolder="text_encoder", revision=args.revision).eval()
-    vae = AutoencoderKL.from_pretrained(sd_path, subfolder="vae", revision=args.revision).eval()
-    unet = UNet2DConditionModel.from_pretrained(sd_path, subfolder="unet", revision=args.revision)
-    vae.requires_grad_(False)
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_clip)
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_clip).eval()
     text_encoder.requires_grad_(False)
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+    vae = AutoencoderKL.from_pretrained(args.pretrained_vae).eval()
+    vae.requires_grad_(False)
+    denoiser = UNet2DConditionModel.from_pretrained(args.pretrained_denoiser, subfolder="denoiser")
+
+    sd_path = "CompVis/stable-diffusion-v1-4"
+    noise_scheduler = DDPMScheduler.from_pretrained(sd_path, subfolder="scheduler")
+
     if args.enable_xformers_memory_efficient_attention:
-        unet.enable_xformers_memory_efficient_attention()
-    unet.train()
+        denoiser.enable_xformers_memory_efficient_attention()
+    denoiser.train()
 
     # EMA
     if args.use_ema:
-        ema_unet = EMAModel(
-            unet.parameters(), model_cls=UNet2DConditionModel, model_config=unet.config, foreach=args.foreach_ema
+        ema_denoiser = EMAModel(
+            denoiser.parameters(), model_cls=UNet2DConditionModel, model_config=denoiser.config, foreach=args.foreach_ema
         )
 
-    # Optimiser
+    # Optimizer
     opt_cls = torch.optim.AdamW
     if args.use_8bit_adam:
         import bitsandbytes as bnb
 
         opt_cls = bnb.optim.AdamW8bit
     optimizer = opt_cls(
-        unet.parameters(),
+        denoiser.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
@@ -324,7 +333,7 @@ def main():
     )
 
     # Wrap with Accelerator
-    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, dataloader, lr_scheduler)
+    denoiser, optimizer, dataloader, lr_scheduler = accelerator.prepare(denoiser, optimizer, dataloader, lr_scheduler)
 
     # Precision-casting of frozen models
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -332,7 +341,17 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     if args.use_ema:
-        ema_unet.to(accelerator.device)
+        ema_denoiser.to(accelerator.device)
+
+
+    # logger.info("***** Running training *****")
+    # logger.info(f"  Num examples = {len(train_dataset)}")
+    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
 
     # ----------------------------------------------------------------------- #
     # TRAINING LOOP
@@ -348,7 +367,7 @@ def main():
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        with accelerator.accumulate(unet):
+        with accelerator.accumulate(denoiser):
             # ----- forward --------------------------------------------------- #
             latents = vae.encode(batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
@@ -376,7 +395,7 @@ def main():
 
             if args.dream_training:
                 noisy_latents, target = compute_dream_and_update_latents(
-                    unet,
+                    denoiser,
                     noise_scheduler,
                     timesteps,
                     noise,
@@ -386,7 +405,7 @@ def main():
                     args.dream_detail_preservation,
                 )
 
-            pred = unet(noisy_latents, timesteps, enc_h, return_dict=False)[0]
+            pred = denoiser(noisy_latents, timesteps, enc_h, return_dict=False)[0]
 
             if args.snr_gamma is None:
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
@@ -402,14 +421,14 @@ def main():
             # ----- backward -------------------------------------------------- #
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                accelerator.clip_grad_norm_(denoiser.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
         if accelerator.sync_gradients:
             if args.use_ema:
-                ema_unet.step(unet.parameters())
+                ema_denoiser.step(denoiser.parameters())
             global_step += 1
             progress.update(1)
             accelerator.log({"train_loss": loss.item()}, step=global_step)
@@ -427,21 +446,21 @@ def main():
                 and accelerator.is_local_main_process
             ):
                 if args.use_ema:
-                    ema_unet.store(unet.parameters()); ema_unet.copy_to(unet.parameters())
-                log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, global_step)
+                    ema_denoiser.store(denoiser.parameters()); ema_denoiser.copy_to(denoiser.parameters())
+                log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, global_step)
                 if args.use_ema:
-                    ema_unet.restore(unet.parameters())
+                    ema_denoiser.restore(denoiser.parameters())
 
     # Final save ------------------------------------------------------------- #
-    unet = accelerator.unwrap_model(unet)
+    denoiser = accelerator.unwrap_model(denoiser)
     if args.use_ema:
-        ema_unet.copy_to(unet.parameters())
+        ema_denoiser.copy_to(denoiser.parameters())
 
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         text_encoder=text_encoder,
         vae=vae,
-        unet=unet,
+        denoiser=denoiser,
         revision=args.revision,
         variant=args.variant,
     )
@@ -450,4 +469,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+    sys.exit(train_ldm(args))
