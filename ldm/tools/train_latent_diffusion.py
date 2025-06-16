@@ -9,7 +9,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
+from torchvision.transforms import v2 as transforms
 from tqdm.auto import tqdm
 import logging
 from braceexpand import braceexpand
@@ -48,22 +48,21 @@ def parse_args():
         type=str,
         default="stabilityai/sd-vae-ft-mse",
         help="HF path to pretrained VAE model (image encoder/decoder). Options could include "
-        "'stabilityai/sd-vae-ft-mse' which was used in stable diffusion v1.4 and works with input resolutions or 256x256 and 512x512."
+        "'stabilityai/sd-vae-ft-mse' which was used in stable diffusion v1.4 and works with input resolutions or 256x256 and 512x512.",
     )
     parser.add_argument(
         "--pretrained_denoiser",
         type=str,
         required=True,
         help="HF path or local path to pretrained latent denoising model, e.g. the U-Net or DiT. "
-        "For stable diffusion use 'CompVis/stable-diffusion-v1-4'"
+        "For stable diffusion use 'CompVis/stable-diffusion-v1-4'",
     )
     parser.add_argument(
         "--dataset_tar_specs",
         type=str,
         nargs="+",
         required=True,
-        help="Brace-expandable TAR shard specs "
-        "(e.g. '/data/laion/{00000..09999}.tar /data/extra/00000.tar').",
+        help="Brace-expandable TAR shard specs (e.g. '/data/laion/{00000..09999}.tar /data/extra/00000.tar').",
     )
     parser.add_argument(
         "--shuffle_buffer",
@@ -74,8 +73,10 @@ def parse_args():
 
     # --- image & caption preprocessing ------------------------------------- #
     parser.add_argument("--resolution", type=int, default=256, help="Square image size for training.")
-    parser.add_argument("--center_crop", action="store_true", help="Use center-crop instead of random crop.")
-    parser.add_argument("--random_flip", action="store_true", help="Random horizontal flip augmentation.")
+    parser.add_argument(
+        "--random_flip", type=float, default=0.5, help="Probability to apply horizontal flip augmentation."
+    )
+    parser.add_argument("--resize", action="store_true", help="Resize the input to the target image")
 
     # --- training hyper-params --------------------------------------------- #
     parser.add_argument("--train_batch_size", type=int, default=16, help="Batch size per step.")
@@ -133,6 +134,15 @@ def parse_args():
         help="Max checkpoints to keep (handled by Accelerate).",
     )
     parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
         default=10000,
@@ -166,37 +176,45 @@ def build_webdataset(args, tokenizer):
     if not tar_files:
         raise FileNotFoundError("No tar files resolved from --dataset_tar_specs")
 
+    # WebDataset decode logic
+    # https://github.com/webdataset/webdataset/blob/main/webdataset/autodecode.py#L299
     dataset = (
         wds.WebDataset(
             tar_files,
-            repeat=True,
+            repeat=False,
             shardshuffle=True,
             detshuffle=True,
             seed=args.seed,
         )
         .shuffle(args.shuffle_buffer)
-        .decode("pil")
+        .decode("pilrgb")
         .to_tuple("jpg", "json")
     )
 
     interpolation = transforms.InterpolationMode.LANCZOS
-    tx = transforms.Compose(
+    ops = [
+        transforms.ToImage(),  # Convert PIL image to torchvision.tv_tensors.Image
+        transforms.ToDtype(torch.uint8, scale=True),
+    ]
+    if args.resize:
+        ops.append(transforms.Resize(args.resolution, interpolation=interpolation))
+    ops.extend(
         [
-            transforms.Resize(args.resolution, interpolation=interpolation),
-            transforms.CenterCrop(args.resolution)
-            if args.center_crop
-            else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.RandomCrop(args.resolution),
+            transforms.RandomHorizontalFlip(p=args.random_flip),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize([0.5], [0.5]),  # hard-coded to mean=std=0.5 due to VAE
         ]
     )
+    tx = transforms.Compose(ops)
 
     def _map(sample):
+        # input longer than 'max_model_length' (77) get truncated
+        # input shorter than 'max_model_length' get padded
         img, meta = sample
-        caption = meta["caption"]  # mandatory
+        caption = meta.get("caption", "An image.")
         return {
-            "pixel_values": tx(img.convert("RGB")),
+            "pixel_values": tx(img),
             "input_ids": tokenizer(
                 caption,
                 max_length=tokenizer.model_max_length,
@@ -215,11 +233,37 @@ def collate_fn(batch):
     return {"pixel_values": pixel_values, "input_ids": input_ids}
 
 
+class DataloaderMaxSteps:
+    def __init__(self, dataloader: torch.utils.data.DataLoader, max_steps: int, start_step: int = 0):
+        self.dataloader = dataloader
+        self.iter = iter(self.dataloader)
+        self.start_step = start_step
+        self.step = start_step
+        self.max_steps = max_steps
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.step >= self.max_steps:
+            raise StopIteration
+        try:
+            batch = next(self.iter)
+        except StopIteration:
+            self.iter = iter(self.dataloader)
+            batch = next(self.iter)
+        self.step += 1
+        return batch
+
+    def __len__(self):
+        return self.max_steps - self.start_step
+
+
 # --------------------------------------------------------------------------- #
 # Validation util
 # --------------------------------------------------------------------------- #
 def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step):
-    logger.info(f"Running validation at step {step}...")
+    accelerator.print(f"Running validation at step {step}...")
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
@@ -256,7 +300,6 @@ def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, we
 # Main
 # --------------------------------------------------------------------------- #
 def train_ldm(args):
-
     # Seed / dirs
     if args.seed is not None:
         set_seed(args.seed)
@@ -301,7 +344,10 @@ def train_ldm(args):
     # EMA
     if args.use_ema:
         ema_denoiser = EMAModel(
-            denoiser.parameters(), model_cls=UNet2DConditionModel, model_config=denoiser.config, foreach=args.foreach_ema
+            denoiser.parameters(),
+            model_cls=UNet2DConditionModel,
+            model_config=denoiser.config,
+            foreach=args.foreach_ema,
         )
 
     # Optimizer
@@ -320,7 +366,10 @@ def train_ldm(args):
 
     # LR scheduler
     lr_scheduler = get_scheduler(
-        args.lr_scheduler, optimizer=optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
     )
 
     # Data
@@ -328,12 +377,15 @@ def train_ldm(args):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.train_batch_size,
+        shuffle=False,  # handled by webdataset
         num_workers=args.dataloader_num_workers,
         collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=True,
     )
 
     # Wrap with Accelerator
-    denoiser, optimizer, dataloader, lr_scheduler = accelerator.prepare(denoiser, optimizer, dataloader, lr_scheduler)
+    denoiser, optimizer, lr_scheduler = accelerator.prepare(denoiser, optimizer, lr_scheduler)
 
     # Precision-casting of frozen models
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -343,32 +395,51 @@ def train_ldm(args):
     if args.use_ema:
         ema_denoiser.to(accelerator.device)
 
+    logger.info("***** Running training *****")
+    logger.info(f"  Batch size = {args.train_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    # logger.info("***** Running training *****")
-    # logger.info(f"  Num examples = {len(train_dataset)}")
-    # logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    # logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    # logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    # logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
 
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+            start_step = 0
+        else:
+            # Restore denoiser weights, optimizer state_dict, scheduler state, random states
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+            start_step = global_step
+    else:
+        start_step = 0
 
-    # ----------------------------------------------------------------------- #
-    # TRAINING LOOP
-    # ----------------------------------------------------------------------- #
-    global_step = 0
-    progress = tqdm(total=args.max_train_steps, desc="Steps", disable=not accelerator.is_local_main_process)
-    data_iter = iter(dataloader)
-
-    while global_step < args.max_train_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:  # WebDataset signal end-of-epoch -> restart
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-
+    dataloader_wrapper = DataloaderMaxSteps(dataloader, args.max_train_steps, start_step=start_step)
+    for step, batch in (
+        progress_bar := tqdm(
+            enumerate(dataloader_wrapper, start=start_step),
+            initial=start_step,
+            total=args.max_train_steps,
+            desc="Training",
+        )
+    ):
         with accelerator.accumulate(denoiser):
-            # ----- forward --------------------------------------------------- #
+            pixel_values = batch["pixel_values"]
+            import ipdb
+
+            ipdb.set_trace()
+
             latents = vae.encode(batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
@@ -383,7 +454,9 @@ def train_ldm(args):
             timesteps = torch.randint(
                 0, noise_scheduler.config.num_train_timesteps, (latents.size(0),), device=latents.device
             ).long()
-            noisy_latents = noise_scheduler.add_noise(latents, new_noise if args.input_perturbation else noise, timesteps)
+            noisy_latents = noise_scheduler.add_noise(
+                latents, new_noise if args.input_perturbation else noise, timesteps
+            )
 
             enc_h = text_encoder(batch["input_ids"].to(accelerator.device), return_dict=False)[0]
 
@@ -430,7 +503,7 @@ def train_ldm(args):
             if args.use_ema:
                 ema_denoiser.step(denoiser.parameters())
             global_step += 1
-            progress.update(1)
+            progress_bar.update(1)
             accelerator.log({"train_loss": loss.item()}, step=global_step)
 
             # Checkpoint
@@ -446,7 +519,8 @@ def train_ldm(args):
                 and accelerator.is_local_main_process
             ):
                 if args.use_ema:
-                    ema_denoiser.store(denoiser.parameters()); ema_denoiser.copy_to(denoiser.parameters())
+                    ema_denoiser.store(denoiser.parameters())
+                    ema_denoiser.copy_to(denoiser.parameters())
                 log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, global_step)
                 if args.use_ema:
                     ema_denoiser.restore(denoiser.parameters())
