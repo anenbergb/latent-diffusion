@@ -23,6 +23,7 @@ from diffusers import (
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils import make_image_grid
@@ -110,7 +111,7 @@ def parse_args():
     )
 
     # --- advanced features -------------------------------------------------- #
-    parser.add_argument("--snr_gamma", type=float, default=None, help="SNR weighting γ (paper 2303.09556).")
+    parser.add_argument("--snr_gamma", type=float, default=None, help="SNR weighting gamma (paper 2303.09556).")
     parser.add_argument("--dream_training", action="store_true", help="Use DREAM loss (paper 2312.00210).")
     parser.add_argument(
         "--dream_detail_preservation",
@@ -124,6 +125,14 @@ def parse_args():
     parser.add_argument("--use_ema", action="store_true", help="Maintain EMA of UNet params.")
     parser.add_argument("--foreach_ema", action="store_true", help="Use foreach-based EMA update (faster).")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Enable xformers.")
+    parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default="epsilon",
+        choices=("epsilon", "v_prediction"),
+        help="The prediction_type that shall be used for training." \
+        "Choose between 'epsilon' or 'v_prediction'"
+    )
 
     # --- misc / logging / checkpoints -------------------------------------- #
     parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save every N steps.")
@@ -159,7 +168,6 @@ def parse_args():
     parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Worker processes for DataLoader.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--output_dir", type=str, default="sd-model-finetuned", help="Checkpoint / TB dir.")
-    parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard sub-dir inside output_dir.")
 
     args = parser.parse_args()
     return args
@@ -182,7 +190,7 @@ def build_webdataset(args, tokenizer):
         wds.WebDataset(
             tar_files,
             repeat=False,
-            shardshuffle=True,
+            shardshuffle=len(tar_files),
             detshuffle=True,
             seed=args.seed,
         )
@@ -305,10 +313,6 @@ def train_ldm(args):
         set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Logging
-    logger = logging.getLogger(__name__)
-    logger.info(f"Output dir → {args.output_dir}")
-
     # Accelerate setup
     proj_cfg = ProjectConfiguration(
         project_dir=args.output_dir,
@@ -332,10 +336,11 @@ def train_ldm(args):
     text_encoder.requires_grad_(False)
     vae = AutoencoderKL.from_pretrained(args.pretrained_vae).eval()
     vae.requires_grad_(False)
-    denoiser = UNet2DConditionModel.from_pretrained(args.pretrained_denoiser, subfolder="denoiser")
 
     sd_path = "CompVis/stable-diffusion-v1-4"
+    denoiser = UNet2DConditionModel.from_pretrained(sd_path, subfolder="unet")
     noise_scheduler = DDPMScheduler.from_pretrained(sd_path, subfolder="scheduler")
+    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
     if args.enable_xformers_memory_efficient_attention:
         denoiser.enable_xformers_memory_efficient_attention()
@@ -395,10 +400,10 @@ def train_ldm(args):
     if args.use_ema:
         ema_denoiser.to(accelerator.device)
 
-    logger.info("***** Running training *****")
-    logger.info(f"  Batch size = {args.train_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    accelerator.print("Running training")
+    accelerator.print(f"  Batch size = {args.train_batch_size}")
+    accelerator.print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    accelerator.print(f"  Total optimization steps = {args.max_train_steps}")
 
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -435,63 +440,78 @@ def train_ldm(args):
         )
     ):
         with accelerator.accumulate(denoiser):
-            pixel_values = batch["pixel_values"]
-            import ipdb
+            pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+            input_ids = batch["input_ids"].to(accelerator.device)
 
-            ipdb.set_trace()
-
-            latents = vae.encode(batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
+            with accelerator.autocast():
+                latent_mean_logvar = vae._encode(pixel_values)
+            
+            # Ensure that the latents are sampled at float32
+            posterior = DiagonalGaussianDistribution(latent_mean_logvar.to(torch.float32))
+            latents = vae.config.scaling_factor * posterior.sample()
 
             noise = torch.randn_like(latents)
             if args.noise_offset:
+                # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                 noise += args.noise_offset * torch.randn(
                     (latents.size(0), latents.size(1), 1, 1), device=latents.device
                 )
-            if args.input_perturbation:
+            if args.input_perturbation: # like data augmentation / regularization
                 new_noise = noise + args.input_perturbation * torch.randn_like(noise)
 
+            # random timestep per image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (latents.size(0),), device=latents.device
-            ).long()
+                0, noise_scheduler.config.num_train_timesteps, (latents.size(0),), 
+                dtype = torch.int64,
+                device=latents.device
+            )
+            # Add noise to the latents according to the noise magnitude at each timestep
+            # forward diffusion process
             noisy_latents = noise_scheduler.add_noise(
-                latents, new_noise if args.input_perturbation else noise, timesteps
+                latents,
+                new_noise if args.input_perturbation else noise,
+                timesteps
             )
+            
+            with accelerator.autocast():
+                # Get the text embedding for conditioning
+                # torch.layer_norm returns fp32, so the output of text_encoder is fp32 rather than bf16
 
-            enc_h = text_encoder(batch["input_ids"].to(accelerator.device), return_dict=False)[0]
+                enc_h = text_encoder(input_ids, return_dict=False)[0]
 
-            target = (
-                noise
-                if noise_scheduler.config.prediction_type == "epsilon"
-                else noise_scheduler.get_velocity(latents, noise, timesteps)
-            )
-
-            if args.dream_training:
-                noisy_latents, target = compute_dream_and_update_latents(
-                    denoiser,
-                    noise_scheduler,
-                    timesteps,
-                    noise,
-                    noisy_latents,
-                    target,
-                    enc_h,
-                    args.dream_detail_preservation,
-                )
-
-            pred = denoiser(noisy_latents, timesteps, enc_h, return_dict=False)[0]
-
-            if args.snr_gamma is None:
-                loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-            else:
-                snr = compute_snr(noise_scheduler, timesteps)
-                w = torch.minimum(snr, args.snr_gamma * torch.ones_like(snr))
+                # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
-                    w = w / snr
+                    target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
-                    w = w / (snr + 1)
-                loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3, 4)) * w).mean()
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            # ----- backward -------------------------------------------------- #
+                if args.dream_training:
+                    noisy_latents, target = compute_dream_and_update_latents(
+                        denoiser,
+                        noise_scheduler,
+                        timesteps,
+                        noise,
+                        noisy_latents,
+                        target,
+                        enc_h,
+                        args.dream_detail_preservation,
+                    )
+
+                pred = denoiser(noisy_latents, timesteps, enc_h, return_dict=False)[0]
+
+                if args.snr_gamma is None:
+                    loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                else:
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    w = torch.minimum(snr, args.snr_gamma * torch.ones_like(snr))
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        w = w / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        w = w / (snr + 1)
+                    loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3)) * w).mean()
+
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(denoiser.parameters(), 1.0)
@@ -503,14 +523,13 @@ def train_ldm(args):
             if args.use_ema:
                 ema_denoiser.step(denoiser.parameters())
             global_step += 1
-            progress_bar.update(1)
             accelerator.log({"train_loss": loss.item()}, step=global_step)
 
             # Checkpoint
             if global_step % args.checkpointing_steps == 0:
                 ckpt = Path(args.output_dir) / f"checkpoint-{global_step}"
                 accelerator.save_state(str(ckpt))
-                logger.info(f"Checkpoint saved → {ckpt}")
+                accelerator.info(f"Checkpoint saved → {ckpt}")
 
             # Validation
             if (
@@ -539,7 +558,7 @@ def train_ldm(args):
         variant=args.variant,
     )
     pipe.save_pretrained(args.output_dir)
-    logger.success("Training complete ✅  Model saved.")
+    accelerator.success("Training complete ✅  Model saved.")
 
 
 if __name__ == "__main__":
