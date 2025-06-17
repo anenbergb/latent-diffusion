@@ -130,8 +130,7 @@ def parse_args():
         type=str,
         default="epsilon",
         choices=("epsilon", "v_prediction"),
-        help="The prediction_type that shall be used for training." \
-        "Choose between 'epsilon' or 'v_prediction'"
+        help="The prediction_type that shall be used for training.Choose between 'epsilon' or 'v_prediction'",
     )
 
     # --- misc / logging / checkpoints -------------------------------------- #
@@ -163,6 +162,12 @@ def parse_args():
         nargs="+",
         default=None,
         help="Prompts to visualize during validation.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=20,
+        help="Number of inference steps to run for image generation.",
     )
     parser.add_argument("--mixed_precision", choices=["fp32", "fp16", "bf16"], default="bf16", help="AMP dtype.")
     parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Worker processes for DataLoader.")
@@ -272,15 +277,15 @@ class DataloaderMaxSteps:
 # --------------------------------------------------------------------------- #
 def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step):
     accelerator.print(f"Running validation at step {step}...")
+    sd_path = "CompVis/stable-diffusion-v1-4"
+    # the SD pipeline will be constructed with the default values from the model_index.json
     pipe = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
+        sd_path,
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        denoiser=denoiser,
+        unet=accelerator.unwrap_model(denoiser),
         safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
         torch_dtype=weight_dtype,
     ).to(accelerator.device)
     pipe.set_progress_bar_config(disable=True)
@@ -290,15 +295,13 @@ def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, we
     images = []
     gen = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
     for prompt in args.validation_prompts:
-        ctx = nullcontext() if torch.backends.mps.is_available() else torch.autocast(accelerator.device.type)
-        with ctx:
-            images.append(pipe(prompt, num_inference_steps=20, generator=gen).images[0])
+        with torch.autocast(accelerator.device.type):
+            images.append(pipe(prompt, num_inference_steps=args.num_inference_steps, generator=gen).images[0])
 
-    grid = make_image_grid(images, 1, len(images))
+    grid = make_image_grid(images, rows=len(images), cols=1)
     grid.save(Path(args.output_dir) / f"val_grid_step_{step}.png")
-    for tr in accelerator.trackers:
-        if tr.name == "tensorboard":
-            tr.writer.add_images("validation", np.stack([np.asarray(i) for i in images]), step, dataformats="NHWC")
+    tensorboard = accelerator.get_tracker("tensorboard")
+    tensorboard.log_images({"validation": np.stack([np.asarray(i) for i in images])}, step, dataformats="NHWC")
 
     del pipe
     torch.cuda.empty_cache()
@@ -318,7 +321,7 @@ def train_ldm(args):
         project_dir=args.output_dir,
         automatic_checkpoint_naming=True,
         total_limit=args.checkpoint_total_limit,
-        iteration=0,
+        iteration=0,  # the current save iteration
     )
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
@@ -425,8 +428,7 @@ def train_ldm(args):
             # Restore denoiser weights, optimizer state_dict, scheduler state, random states
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
-            start_step = global_step
+            start_step = int(path.split("_")[1])
     else:
         start_step = 0
 
@@ -439,13 +441,13 @@ def train_ldm(args):
             desc="Training",
         )
     ):
-        with accelerator.accumulate(denoiser):
+        with accelerator.accumulate(denoiser):  # accumulate gradients denoiser.grad
             pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
             input_ids = batch["input_ids"].to(accelerator.device)
 
             with accelerator.autocast():
                 latent_mean_logvar = vae._encode(pixel_values)
-            
+
             # Ensure that the latents are sampled at float32
             posterior = DiagonalGaussianDistribution(latent_mean_logvar.to(torch.float32))
             latents = vae.config.scaling_factor * posterior.sample()
@@ -456,28 +458,29 @@ def train_ldm(args):
                 noise += args.noise_offset * torch.randn(
                     (latents.size(0), latents.size(1), 1, 1), device=latents.device
                 )
-            if args.input_perturbation: # like data augmentation / regularization
+            if args.input_perturbation:  # like data augmentation / regularization
                 new_noise = noise + args.input_perturbation * torch.randn_like(noise)
 
             # random timestep per image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (latents.size(0),), 
-                dtype = torch.int64,
-                device=latents.device
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (latents.size(0),),
+                dtype=torch.int64,
+                device=latents.device,
             )
             # Add noise to the latents according to the noise magnitude at each timestep
             # forward diffusion process
             noisy_latents = noise_scheduler.add_noise(
-                latents,
-                new_noise if args.input_perturbation else noise,
-                timesteps
+                latents, new_noise if args.input_perturbation else noise, timesteps
             )
-            
+
             with accelerator.autocast():
                 # Get the text embedding for conditioning
                 # torch.layer_norm returns fp32, so the output of text_encoder is fp32 rather than bf16
+                # https://docs.pytorch.org/docs/stable/amp.html#cuda-ops-that-can-autocast-to-float32
 
-                enc_h = text_encoder(input_ids, return_dict=False)[0]
+                enc_h = text_encoder(input_ids, return_dict=False)[0].to(weight_dtype)
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -492,73 +495,78 @@ def train_ldm(args):
                         denoiser,
                         noise_scheduler,
                         timesteps,
-                        noise,
-                        noisy_latents,
-                        target,
+                        noise.to(weight_dtype),
+                        noisy_latents.to(weight_dtype),
+                        target.to(weight_dtype),
                         enc_h,
                         args.dream_detail_preservation,
                     )
 
-                pred = denoiser(noisy_latents, timesteps, enc_h, return_dict=False)[0]
+                # the final GroupNorm converts the activations to fp32
+                pred = denoiser(noisy_latents.to(weight_dtype), timesteps, enc_h, return_dict=False)[0]
 
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                else:
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    w = torch.minimum(snr, args.snr_gamma * torch.ones_like(snr))
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        w = w / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        w = w / (snr + 1)
-                    loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3)) * w).mean()
+            if args.snr_gamma is None:
+                loss = F.mse_loss(pred.to(torch.float32), target.to(torch.float32), reduction="mean")
+            else:
+                snr = compute_snr(noise_scheduler, timesteps)
+                w = torch.minimum(snr, args.snr_gamma * torch.ones_like(snr))
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    w = w / snr
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    w = w / (snr + 1)
+                loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3)) * w).mean()
 
             accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(denoiser.parameters(), 1.0)
+            accelerator.clip_grad_norm_(denoiser.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
-        if accelerator.sync_gradients:
+        # end of accelerator.accumulate context
+
+        if args.use_ema:
+            ema_denoiser.step(denoiser.parameters())
+
+        current_lr = lr_scheduler.get_last_lr()[0]
+        logs = {
+            "loss/train": loss.detach().item(),
+            "lr": current_lr,
+        }
+        accelerator.log(logs, step=step)
+        progress_bar.set_postfix(**logs)
+
+        if step > 0 and (step % args.checkpointing_steps == 0 or step == args.max_train_steps - 1):
+            accelerator.project_configuration.iteration = step
+            accelerator.save_state()
+            accelerator.print(f"Checkpoint {step} saved")
+
+        # Validation
+        if args.validation_prompts and step % args.validation_steps == 0:
             if args.use_ema:
-                ema_denoiser.step(denoiser.parameters())
-            global_step += 1
-            accelerator.log({"train_loss": loss.item()}, step=global_step)
+                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                ema_denoiser.store(denoiser.parameters())
+                ema_denoiser.copy_to(denoiser.parameters())
+            log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step)
+            if args.use_ema:
+                # Switch back to the original UNet parameters
+                ema_denoiser.restore(denoiser.parameters())
 
-            # Checkpoint
-            if global_step % args.checkpointing_steps == 0:
-                ckpt = Path(args.output_dir) / f"checkpoint-{global_step}"
-                accelerator.save_state(str(ckpt))
-                accelerator.info(f"Checkpoint saved → {ckpt}")
+    # # Final save ------------------------------------------------------------- #
+    # denoiser = accelerator.unwrap_model(denoiser)
+    # if args.use_ema:
+    #     ema_denoiser.copy_to(denoiser.parameters())
 
-            # Validation
-            if (
-                args.validation_prompts
-                and global_step % args.validation_steps == 0
-                and accelerator.is_local_main_process
-            ):
-                if args.use_ema:
-                    ema_denoiser.store(denoiser.parameters())
-                    ema_denoiser.copy_to(denoiser.parameters())
-                log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, global_step)
-                if args.use_ema:
-                    ema_denoiser.restore(denoiser.parameters())
-
-    # Final save ------------------------------------------------------------- #
-    denoiser = accelerator.unwrap_model(denoiser)
-    if args.use_ema:
-        ema_denoiser.copy_to(denoiser.parameters())
-
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        text_encoder=text_encoder,
-        vae=vae,
-        denoiser=denoiser,
-        revision=args.revision,
-        variant=args.variant,
-    )
-    pipe.save_pretrained(args.output_dir)
+    # pipe = StableDiffusionPipeline.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     text_encoder=text_encoder,
+    #     vae=vae,
+    #     denoiser=denoiser,
+    #     revision=args.revision,
+    #     variant=args.variant,
+    # )
+    # pipe.save_pretrained(args.output_dir)
     accelerator.success("Training complete ✅  Model saved.")
+    return 0
 
 
 if __name__ == "__main__":

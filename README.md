@@ -146,3 +146,9 @@ https://arxiv.org/abs/2303.09556
 Compute loss-weights as per Section 3.4 of
 Since we predict the noise instead of x_0, the original formulation is slightly changed.
 This is discussed in Section 4.2 of the same paper.
+
+
+### Gradient Accumulation
+Gradient accumulation is a technique where you can train on bigger batch sizes than your machine would normally be able to fit into memory. This is done by accumulating gradients over several batches, and only stepping the optimizer after a certain number of batches have been performed.
+
+https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
