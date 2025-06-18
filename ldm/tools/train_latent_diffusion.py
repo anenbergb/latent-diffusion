@@ -5,6 +5,10 @@ import math
 from pathlib import Path
 from contextlib import nullcontext
 import sys
+from typing import Optional
+import inspect
+import json
+
 
 import numpy as np
 import torch
@@ -17,6 +21,7 @@ import webdataset as wds
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
+import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -27,7 +32,9 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils import make_image_grid
+from diffusers.configuration_utils import ConfigMixin
 from transformers import CLIPTextModel, CLIPTokenizer
+from huggingface_hub import hf_hub_download
 
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +59,49 @@ def parse_args():
         "'stabilityai/sd-vae-ft-mse' which was used in stable diffusion v1.4 and works with input resolutions or 256x256 and 512x512.",
     )
     parser.add_argument(
-        "--pretrained_denoiser",
+        "--denoiser_model",
         type=str,
-        required=True,
-        help="HF path or local path to pretrained latent denoising model, e.g. the U-Net or DiT. "
-        "For stable diffusion use 'CompVis/stable-diffusion-v1-4'",
+        default="unet",
+        choices=[
+            "unet",
+        ],
+        help="Name of the denoiser model to use. ",
+    )
+    parser.add_argument(
+        "--hf_model_repo_id",
+        type=str,
+        help="Override the choice of denoiser_model to instead use the model "
+        "from the HF repo ID e.g. 'CompVis/stable-diffusion-v1-4'.",
+    )
+    parser.add_argument(
+        "--hf_model_subfolder",
+        type=str,
+        default="unet",
+        help="HF repo subfolder for the denoiser model. "
+        "e.g. 'unet' for hf_model_repo_id: 'CompVis/stable-diffusion-v1-4' and "
+        "'transformer' for hf_model_repo_id: 'facebook/DiT-XL-2-256'.",
+    )
+    parser.add_argument(
+        "--diffusion_scheduler",
+        type=str,
+        default="ddpm",
+        choices=[
+            "ddpm",
+        ],
+        help="Diffusion scheduler to use. Currently only 'ddpm' is supported.",
+    )
+    parser.add_argument(
+        "--hf_scheduler_repo_id",
+        type=str,
+        help="HF repo ID for the diffusion scheduler config. "
+        "If not provided, the default scheduler config will be used based on the diffusion_scheduler argument.",
+    )
+    parser.add_argument(
+        "--hf_scheduler_subfolder",
+        type=str,
+        default="scheduler",
+        help="HF repo subfolder for the diffusion scheduler config. "
+        "e.g. 'scheduler' for hf_scheduler_repo_id: 'CompVis/stable-diffusion-v1-4'.",
     )
     parser.add_argument(
         "--dataset_tar_specs",
@@ -176,6 +221,58 @@ def parse_args():
 
     args = parser.parse_args()
     return args
+
+
+# --------------------------------------------------------------------------- #
+# Huggingface Models
+# --------------------------------------------------------------------------- #
+def build_diffusers_model_registry():
+    registry = {}
+    for name, obj in inspect.getmembers(diffusers.models, inspect.isclass):
+        # Ensure it's a diffusers model and a subclass of ConfigMixin
+        if issubclass(obj, ConfigMixin) and obj.__module__.startswith("diffusers.models"):
+            registry[name] = obj
+    return registry
+
+
+def load_hf_model_from_config(repo_id: str, subfolder: Optional[str] = None, config_name: str = "config.json"):
+    config_path = hf_hub_download(repo_id=repo_id, subfolder=subfolder, filename=config_name)
+    with open(config_path) as f:
+        config = json.load(f)
+
+    class_name = config["_class_name"]
+    registry = build_diffusers_model_registry()
+
+    if class_name not in registry:
+        raise ValueError(f"Unknown model class: {class_name}")
+
+    model_class = registry[class_name]
+    return model_class.from_config(config)
+
+
+def build_diffusers_scheduler_registry():
+    registry = {}
+    for name, obj in inspect.getmembers(diffusers.schedulers, inspect.isclass):
+        if issubclass(obj, ConfigMixin) and obj.__module__.startswith("diffusers.schedulers"):
+            registry[name] = obj
+    return registry
+
+
+def load_hf_scheduler_from_config(
+    repo_id: str, subfolder: str = "scheduler", config_name: str = "scheduler_config.json"
+):
+    config_path = hf_hub_download(repo_id=repo_id, subfolder=subfolder, filename=config_name)
+    with open(config_path) as f:
+        config = json.load(f)
+
+    class_name = config["_class_name"]
+    registry = build_diffusers_scheduler_registry()
+
+    if class_name not in registry:
+        raise ValueError(f"Unknown scheduler class: {class_name}")
+
+    scheduler_class = registry[class_name]
+    return scheduler_class.from_config(config)
 
 
 # --------------------------------------------------------------------------- #
@@ -340,11 +437,23 @@ def train_ldm(args):
     vae = AutoencoderKL.from_pretrained(args.pretrained_vae).eval()
     vae.requires_grad_(False)
 
-    sd_path = "CompVis/stable-diffusion-v1-4"
-    denoiser = UNet2DConditionModel.from_pretrained(sd_path, subfolder="unet")
-    noise_scheduler = DDPMScheduler.from_pretrained(sd_path, subfolder="scheduler")
-    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+    if args.hf_model_repo_id:
+        denoiser = load_hf_model_from_config(
+            repo_id=args.hf_model_repo_id,
+            subfolder=args.hf_model_subfolder,
+        )
+    else:
+        raise NotImplementedError("Loading custom denoiser models is not implemented yet.")
 
+    if args.hf_scheduler_repo_id:
+        noise_scheduler = load_hf_scheduler_from_config(
+            repo_id=args.hf_scheduler_repo_id,
+            subfolder=args.hf_scheduler_subfolder,
+        )
+    else:
+        raise NotImplementedError("Loading custom diffusion schedulers is not implemented yet.")
+
+    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     if args.enable_xformers_memory_efficient_attention:
         denoiser.enable_xformers_memory_efficient_attention()
     denoiser.train()

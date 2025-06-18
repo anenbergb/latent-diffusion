@@ -5,14 +5,17 @@ export CUDA_VISIBLE_DEVICES=0
 conda activate ldm
 
 export ACCELERATE_LOG_LEVEL="INFO"
-# CLIP_MODEL="laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
-CLIP_MODEL="openai/clip-vit-large-patch14"
+CLIP_MODEL="laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
+# CLIP_MODEL="openai/clip-vit-large-patch14"
 
 rm -rf /media/bryan/ssd01/expr/latent_diffusion/debug/run01
 accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
 --output_dir /media/bryan/ssd01/expr/latent_diffusion/debug/run01 \
 --pretrained_clip $CLIP_MODEL \
---pretrained_denoiser "CompVis/stable-diffusion-v1-4" \
+--hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
+--hf_model_subfolder "unet" \
+--hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
+--hf_scheduler_subfolder "scheduler" \
 --dataset_tar_specs \
 "/media/bryan/nvme2/data/laion2b-aesthetic-square-256/{00000..00001}.tar" \
 "/media/bryan/nvme2/data/laion2b-aesthetic-square-plus54-256/00000.tar" \
