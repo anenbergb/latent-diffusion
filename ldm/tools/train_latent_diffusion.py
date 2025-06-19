@@ -1,9 +1,6 @@
 import argparse
 import os
-import random
-import math
 from pathlib import Path
-from contextlib import nullcontext
 import sys
 from typing import Optional
 import inspect
@@ -11,7 +8,6 @@ import json
 from PIL import Image
 
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import v2 as transforms
@@ -26,7 +22,6 @@ from accelerate.utils import ProjectConfiguration, set_seed
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    UNet2DConditionModel,
 )
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
@@ -38,7 +33,7 @@ from huggingface_hub import hf_hub_download
 
 
 def parse_args():
-    parser = argparse.ArgumentParser("Stable-Diffusion WebDataset finetuner")
+    parser = argparse.ArgumentParser("Latent Diffusion Trainer")
 
     # --- model & data ------------------------------------------------------- #
     parser.add_argument(
@@ -56,25 +51,25 @@ def parse_args():
         "'stabilityai/sd-vae-ft-mse' which was used in stable diffusion v1.4 and works with input resolutions or 256x256 and 512x512.",
     )
     parser.add_argument(
-        "--denoiser_model",
+        "--diffusion_model",
         type=str,
         default="unet",
         choices=[
             "unet",
         ],
-        help="Name of the denoiser model to use. ",
+        help="Name of the diffusion_model model to use. ",
     )
     parser.add_argument(
         "--hf_model_repo_id",
         type=str,
-        help="Override the choice of denoiser_model to instead use the model "
+        help="Override the choice of diffusion_model to instead use the model "
         "from the HF repo ID e.g. 'CompVis/stable-diffusion-v1-4'.",
     )
     parser.add_argument(
         "--hf_model_subfolder",
         type=str,
         default="unet",
-        help="HF repo subfolder for the denoiser model. "
+        help="HF repo subfolder for the diffusion_model. "
         "e.g. 'unet' for hf_model_repo_id: 'CompVis/stable-diffusion-v1-4' and "
         "'transformer' for hf_model_repo_id: 'facebook/DiT-XL-2-256'.",
     )
@@ -133,7 +128,7 @@ def parse_args():
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
+        default="constant_with_warmup",
         choices=[
             "linear",
             "cosine",
@@ -377,7 +372,7 @@ def generate(
     tokenizer,
     text_encoder,
     vae,
-    denoiser,
+    diffusion_model,
     noise_scheduler,
     prompt: str,
     num_inference_steps: int = 50,
@@ -423,7 +418,7 @@ def generate(
         latent_in = torch.cat([latents] * 2, dim=0)  # (2,4,32,32)
         latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
 
-        noise_pred = denoiser(latent_in, timestep, embeds, return_dict=False)[0]
+        noise_pred = diffusion_model(latent_in, timestep, embeds, return_dict=False)[0]
         eps_uncond, eps_cond = noise_pred.chunk(2)
 
         # Classifier-free guidance
@@ -449,14 +444,14 @@ def log_validation(
     tokenizer,
     text_encoder,
     vae,
-    denoiser,
+    diffusion_model,
     noise_scheduler,
     args,
     accelerator,
     train_step,
 ):
     accelerator.print(f"Running validation at step {train_step}...")
-    denoiser.eval()
+    diffusion_model.eval()
     images = []
     for prompt in args.validation_prompts:
         with accelerator.autocast():
@@ -464,7 +459,7 @@ def log_validation(
                 tokenizer,
                 text_encoder,
                 vae,
-                denoiser,
+                diffusion_model,
                 noise_scheduler,
                 prompt=prompt,
                 num_inference_steps=args.num_inference_steps,
@@ -483,7 +478,7 @@ def log_validation(
     tracker = accelerator.get_tracker("tensorboard")
     tracker.log_images({"validation": image_grid}, train_step, dataformats="CHW")
     torch.cuda.empty_cache()
-    denoiser.train()
+    diffusion_model.train()
 
 
 def log_validation_prompts(
@@ -528,12 +523,12 @@ def train_ldm(args):
     vae.requires_grad_(False)
 
     if args.hf_model_repo_id:
-        denoiser = load_hf_model_from_config(
+        diffusion_model = load_hf_model_from_config(
             repo_id=args.hf_model_repo_id,
             subfolder=args.hf_model_subfolder,
         )
     else:
-        raise NotImplementedError("Loading custom denoiser models is not implemented yet.")
+        raise NotImplementedError("Loading custom diffusion models is not implemented yet.")
 
     if args.hf_scheduler_repo_id:
         noise_scheduler = load_hf_scheduler_from_config(
@@ -545,15 +540,15 @@ def train_ldm(args):
 
     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     if args.enable_xformers_memory_efficient_attention:
-        denoiser.enable_xformers_memory_efficient_attention()
-    denoiser.train()
+        diffusion_model.enable_xformers_memory_efficient_attention()
+    diffusion_model.train()
 
     # EMA
     if args.use_ema:
-        ema_denoiser = EMAModel(
-            denoiser.parameters(),
-            model_cls=type(denoiser),
-            model_config=denoiser.config,
+        ema_diffusion_model = EMAModel(
+            diffusion_model.parameters(),
+            model_cls=type(diffusion_model),
+            model_config=diffusion_model.config,
             foreach=args.foreach_ema,
         )
 
@@ -564,7 +559,7 @@ def train_ldm(args):
 
         opt_cls = bnb.optim.AdamW8bit
     optimizer = opt_cls(
-        denoiser.parameters(),
+        diffusion_model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.999),
         weight_decay=1e-2,
@@ -592,7 +587,7 @@ def train_ldm(args):
     )
 
     # Wrap with Accelerator
-    denoiser, optimizer, lr_scheduler = accelerator.prepare(denoiser, optimizer, lr_scheduler)
+    diffusion_model, optimizer, lr_scheduler = accelerator.prepare(diffusion_model, optimizer, lr_scheduler)
 
     # Precision-casting of frozen models
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -600,7 +595,7 @@ def train_ldm(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     if args.use_ema:
-        ema_denoiser.to(accelerator.device)
+        ema_diffusion_model.to(accelerator.device)
 
     accelerator.print("Running training")
     accelerator.print(f"  Batch size = {args.train_batch_size}")
@@ -608,26 +603,25 @@ def train_ldm(args):
     accelerator.print(f"  Total optimization steps = {args.max_train_steps}")
 
     if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
+        path = args.resume_from_checkpoint
+        if args.resume_from_checkpoint == "latest":
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            dirs = sorted(dirs, key=lambda x: int(x.split("_")[1]))
+            path = os.path.join(args.output_dir, dirs[-1]) if len(dirs) > 0 else None
 
-        if path is None:
+        # path should be formatated as /path/to/output_dir/checkpoints/checkpoint_XXXXX
+        if path is None or not os.path.exists(path):
             accelerator.print(
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
-            args.resume_from_checkpoint = None
             start_step = 0
         else:
-            # Restore denoiser weights, optimizer state_dict, scheduler state, random states
+            # Restore diffusion_model weights, optimizer state_dict, scheduler state, random states
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            start_step = int(path.split("_")[1])
+            accelerator.load_state(path)
+            start_step = int(path.split("_")[-1])
     else:
         start_step = 0
 
@@ -642,7 +636,7 @@ def train_ldm(args):
             desc="Training",
         )
     ):
-        with accelerator.accumulate(denoiser):  # accumulate gradients denoiser.grad
+        with accelerator.accumulate(diffusion_model):  # accumulate gradients diffusion_model.grad
             pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
             input_ids = batch["input_ids"].to(accelerator.device)
 
@@ -693,7 +687,7 @@ def train_ldm(args):
 
                 if args.dream_training:
                     noisy_latents, target = compute_dream_and_update_latents(
-                        denoiser,
+                        diffusion_model,
                         noise_scheduler,
                         timesteps,
                         noise.to(weight_dtype),
@@ -704,7 +698,7 @@ def train_ldm(args):
                     )
 
                 # the final GroupNorm converts the activations to fp32
-                pred = denoiser(noisy_latents.to(weight_dtype), timesteps, enc_h, return_dict=False)[0]
+                pred = diffusion_model(noisy_latents.to(weight_dtype), timesteps, enc_h, return_dict=False)[0]
 
             if args.snr_gamma is None:
                 loss = F.mse_loss(pred.to(torch.float32), target.to(torch.float32), reduction="mean")
@@ -718,7 +712,7 @@ def train_ldm(args):
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3)) * w).mean()
 
             accelerator.backward(loss)
-            accelerator.clip_grad_norm_(denoiser.parameters(), 1.0)
+            accelerator.clip_grad_norm_(diffusion_model.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -726,7 +720,7 @@ def train_ldm(args):
         # end of accelerator.accumulate context
 
         if args.use_ema:
-            ema_denoiser.step(denoiser.parameters())
+            ema_diffusion_model.step(diffusion_model.parameters())
 
         current_lr = lr_scheduler.get_last_lr()[0]
         logs = {
@@ -745,23 +739,23 @@ def train_ldm(args):
         if step > 0 and args.validation_prompts and step % args.validation_steps == 0:
             if args.use_ema:
                 # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                ema_denoiser.store(denoiser.parameters())
-                ema_denoiser.copy_to(denoiser.parameters())
-            log_validation(tokenizer, text_encoder, vae, denoiser, noise_scheduler, args, accelerator, step)
+                ema_diffusion_model.store(diffusion_model.parameters())
+                ema_diffusion_model.copy_to(diffusion_model.parameters())
+            log_validation(tokenizer, text_encoder, vae, diffusion_model, noise_scheduler, args, accelerator, step)
             if args.use_ema:
                 # Switch back to the original UNet parameters
-                ema_denoiser.restore(denoiser.parameters())
+                ema_diffusion_model.restore(diffusion_model.parameters())
 
     # # Final save ------------------------------------------------------------- #
-    # denoiser = accelerator.unwrap_model(denoiser)
+    # diffusion_model = accelerator.unwrap_model(diffusion_model)
     # if args.use_ema:
-    #     ema_denoiser.copy_to(denoiser.parameters())
+    #     ema_diffusion_model.copy_to(diffusion_model.parameters())
 
     # pipe = StableDiffusionPipeline.from_pretrained(
     #     args.pretrained_model_name_or_path,
     #     text_encoder=text_encoder,
     #     vae=vae,
-    #     denoiser=denoiser,
+    #     diffusion_model=diffusion_model,
     #     revision=args.revision,
     #     variant=args.variant,
     # )
