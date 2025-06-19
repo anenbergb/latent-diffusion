@@ -38,7 +38,7 @@ conda env config vars list
 - https://github.com/CompVis/taming-transformers
 
 
-# Latent Diffusion Model Traine
+# Latent Diffusion Model Trainer
 
 
 ### CLIP input caption standardization
@@ -152,3 +152,23 @@ This is discussed in Section 4.2 of the same paper.
 Gradient accumulation is a technique where you can train on bigger batch sizes than your machine would normally be able to fit into memory. This is done by accumulating gradients over several batches, and only stepping the optimizer after a certain number of batches have been performed.
 
 https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
+
+### Training Steps
+Stable Diffusion V1.1 was trained for 3237k steps at 256x256 resolution on LAION-2B-en. with global batch size of 2048
+
+Reference
+- https://huggingface.co/CompVis/stable-diffusion-v1-1
+
+### Other training details
+-  10% dropping of the text-conditioning to improve classifier-free guidance sampling.
+- warmup to 0.0001 for 10,000 steps and then kept constant
+
+
+# Diffusion Model Architectures
+
+## Stable Diffusion - U-Net
+
+## Diffusion Tarnsformer (DiT)
+https://arxiv.org/abs/2212.09748
+https://github.com/facebookresearch/DiT
+https://huggingface.co/facebook/DiT-XL-2-256
