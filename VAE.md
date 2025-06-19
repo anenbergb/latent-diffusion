@@ -307,3 +307,20 @@ published to [Huggingface sd-vae-ft-mse](https://huggingface.co/stabilityai/sd-v
 The training batch size = 192 on 16x A100s (batch size = 12 per GPU)
 
 OpenImages V7 can be [downloaded from FiftyOne](https://docs.voxel51.com/dataset_zoo/datasets.html#open-images-v7)
+
+
+### Scaling Factor
+scaling_factor = "how hard the VAE stretches / shrinks its latents"
+```python
+# encode an image
+latents = vae.encode(img).latent_dist.sample()     # raw latents
+latents = latents * vae.config.scaling_factor      # = 0.18215 for SD-v1
+
+# ...diffusion steps...
+
+# decode back to RGB
+latents = latents / vae.config.scaling_factor
+image   = vae.decode(latents).sample
+```
+The encoder output is multiplied by 0.18215 to roughly whiten the encoded vector to unit variance.
+The stable diffusion authors arrived at the scaling_factor value by running a few batches of images through the encoder and computed the empirical standard deviation σ of each latent channel. The average of those σ values became the constant. For SD v1 that gave 0.18215 (≈ 1/5.49).

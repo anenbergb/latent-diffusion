@@ -8,12 +8,14 @@ import sys
 from typing import Optional
 import inspect
 import json
+from PIL import Image
 
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision.transforms import v2 as transforms
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 import logging
 from braceexpand import braceexpand
@@ -24,8 +26,6 @@ from accelerate.utils import ProjectConfiguration, set_seed
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    DDPMScheduler,
-    StableDiffusionPipeline,
     UNet2DConditionModel,
 )
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -37,9 +37,6 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from huggingface_hub import hf_hub_download
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
 def parse_args():
     parser = argparse.ArgumentParser("Stable-Diffusion WebDataset finetuner")
 
@@ -214,6 +211,12 @@ def parse_args():
         default=20,
         help="Number of inference steps to run for image generation.",
     )
+    parser.add_argument(
+        "--classifier_free_guidance_scale",
+        type=int,
+        default=7.5,
+        help="Classifier-free guidance scale for inference (7.5 is a good default).",
+    )
     parser.add_argument("--mixed_precision", choices=["fp32", "fp16", "bf16"], default="bf16", help="AMP dtype.")
     parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Worker processes for DataLoader.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
@@ -223,9 +226,6 @@ def parse_args():
     return args
 
 
-# --------------------------------------------------------------------------- #
-# Huggingface Models
-# --------------------------------------------------------------------------- #
 def build_diffusers_model_registry():
     registry = {}
     for name, obj in inspect.getmembers(diffusers.models, inspect.isclass):
@@ -275,9 +275,6 @@ def load_hf_scheduler_from_config(
     return scheduler_class.from_config(config)
 
 
-# --------------------------------------------------------------------------- #
-# Data utilities
-# --------------------------------------------------------------------------- #
 def build_webdataset(args, tokenizer):
     # Expand brace patterns into concrete *.tar paths
     tar_files = []
@@ -369,44 +366,137 @@ class DataloaderMaxSteps:
         return self.max_steps - self.start_step
 
 
-# --------------------------------------------------------------------------- #
-# Validation util
-# --------------------------------------------------------------------------- #
-def log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step):
-    accelerator.print(f"Running validation at step {step}...")
-    sd_path = "CompVis/stable-diffusion-v1-4"
-    # the SD pipeline will be constructed with the default values from the model_index.json
-    pipe = StableDiffusionPipeline.from_pretrained(
-        sd_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=accelerator.unwrap_model(denoiser),
-        safety_checker=None,
-        torch_dtype=weight_dtype,
-    ).to(accelerator.device)
-    pipe.set_progress_bar_config(disable=True)
-    if args.enable_xformers_memory_efficient_attention:
-        pipe.enable_xformers_memory_efficient_attention()
+def get_vae_downscale(config: dict) -> int:
+    """Return the spatial reduction factor of a Diffusers AutoencoderKL."""
+    n_blocks = len(config["down_block_types"])
+    return 2 ** (n_blocks - 1)  # last block keeps resolution
 
+
+@torch.inference_mode()
+def generate(
+    tokenizer,
+    text_encoder,
+    vae,
+    denoiser,
+    noise_scheduler,
+    prompt: str,
+    num_inference_steps: int = 50,
+    guidance_scale: float = 7.5,
+    height: int = 256,
+    width: int = 256,
+    seed: int | None = None,
+    device: torch.device = torch.device("cuda"),
+    weight_dtype: torch.dtype = torch.bfloat16,
+    return_type: str = "pil",  #
+) -> Image.Image:
+    # Prompt -> embeddings (classifier-free guidance = cond + uncond)
+    text_inputs = tokenizer(
+        [prompt], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+    ).input_ids.to(device=device)
+
+    uncond_inputs = tokenizer(
+        [""], max_length=tokenizer.model_max_length, padding="max_length", return_tensors="pt"
+    ).input_ids.to(device=device)
+
+    text_embeds = text_encoder(text_inputs, return_dict=False)[0].to(dtype=weight_dtype)
+    uncond_embeds = text_encoder(uncond_inputs, return_dict=False)[0].to(dtype=weight_dtype)
+    embeds = torch.cat([uncond_embeds, text_embeds], dim=0)  # (2, T, 768)
+
+    noise_scheduler.set_timesteps(num_inference_steps, device=device)
+
+    # Latent tensor initialized with pure Gaussian noise
+    gen = None if seed is None else torch.Generator(device=device).manual_seed(seed)
+
+    latent_channels = vae.config.latent_channels
+    latent_downscale = get_vae_downscale(vae.config)  # 8
+    latents = torch.randn(
+        (1, latent_channels, height // latent_downscale, width // latent_downscale),
+        generator=gen,
+        device=device,
+        dtype=weight_dtype,
+    )  # (1,4,32,32)
+    latents *= noise_scheduler.init_noise_sigma  # match training scale
+
+    # Diffusion (reverse) loop
+    for timestep in noise_scheduler.timesteps:
+        # Duplicate for (uncond, cond) batches
+        latent_in = torch.cat([latents] * 2, dim=0)  # (2,4,32,32)
+        latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
+
+        noise_pred = denoiser(latent_in, timestep, embeds, return_dict=False)[0]
+        eps_uncond, eps_cond = noise_pred.chunk(2)
+
+        # Classifier-free guidance
+        eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+        latents = noise_scheduler.step(eps, timestep, latents).prev_sample
+
+    # Latents -> image space through VAE decoder
+    latents = latents / vae.config.scaling_factor  # SD latent scaling
+    image = vae.decode(latents).sample
+
+    # Post-process [-1,1] -> [0,1] -> [0,255]
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = (255 * image.to(device="cpu")).to(torch.uint8).squeeze(0)
+    if return_type == "pil":
+        image = image.permute(0, 2, 3, 1).numpy()[0]
+        return Image.fromarray((image * 255).astype("uint8"))
+    else:
+        return image
+
+
+def log_validation(
+    tokenizer,
+    text_encoder,
+    vae,
+    denoiser,
+    noise_scheduler,
+    args,
+    accelerator,
+    train_step,
+):
+    accelerator.print(f"Running validation at step {train_step}...")
+    denoiser.eval()
     images = []
-    gen = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
     for prompt in args.validation_prompts:
-        with torch.autocast(accelerator.device.type):
-            images.append(pipe(prompt, num_inference_steps=args.num_inference_steps, generator=gen).images[0])
+        with accelerator.autocast():
+            image = generate(
+                tokenizer,
+                text_encoder,
+                vae,
+                denoiser,
+                noise_scheduler,
+                prompt=prompt,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.classifier_free_guidance_scale,
+                height=args.resolution,
+                width=args.resolution,
+                seed=args.seed,
+                device=accelerator.device,
+                return_type="torch",
+            )
+            images.append(image)
 
-    grid = make_image_grid(images, rows=len(images), cols=1)
-    grid.save(Path(args.output_dir) / f"val_grid_step_{step}.png")
-    tensorboard = accelerator.get_tracker("tensorboard")
-    tensorboard.log_images({"validation": np.stack([np.asarray(i) for i in images])}, step, dataformats="NHWC")
-
-    del pipe
+    image_grid = make_grid(images, nrow=3, padding=0, value_range=(0, 255))  # (C,H,W)
+    image_grid_pil = Image.fromarray(image_grid.permute(1, 2, 0).numpy())
+    image_grid_pil.save(Path(args.output_dir) / f"val_images_step_{train_step}.png")
+    tracker = accelerator.get_tracker("tensorboard")
+    tracker.log_images({"validation": image_grid}, train_step, dataformats="CHW")
     torch.cuda.empty_cache()
+    denoiser.train()
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
+def log_validation_prompts(
+    accelerator: Accelerator,
+    validation_prompts: Optional[list[str]] = None,
+):
+    if validation_prompts is None:
+        return
+
+    for i, prompt in enumerate(validation_prompts):
+        accelerator.log({f"val_prompt_{i}": prompt})
+
+
 def train_ldm(args):
     # Seed / dirs
     if args.seed is not None:
@@ -462,7 +552,7 @@ def train_ldm(args):
     if args.use_ema:
         ema_denoiser = EMAModel(
             denoiser.parameters(),
-            model_cls=UNet2DConditionModel,
+            model_cls=type(denoiser),
             model_config=denoiser.config,
             foreach=args.foreach_ema,
         )
@@ -540,6 +630,8 @@ def train_ldm(args):
             start_step = int(path.split("_")[1])
     else:
         start_step = 0
+
+    log_validation_prompts(accelerator, args.validation_prompts)
 
     dataloader_wrapper = DataloaderMaxSteps(dataloader, args.max_train_steps, start_step=start_step)
     for step, batch in (
@@ -650,12 +742,12 @@ def train_ldm(args):
             accelerator.print(f"Checkpoint {step} saved")
 
         # Validation
-        if args.validation_prompts and step % args.validation_steps == 0:
+        if step > 0 and args.validation_prompts and step % args.validation_steps == 0:
             if args.use_ema:
                 # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                 ema_denoiser.store(denoiser.parameters())
                 ema_denoiser.copy_to(denoiser.parameters())
-            log_validation(vae, text_encoder, tokenizer, denoiser, args, accelerator, weight_dtype, step)
+            log_validation(tokenizer, text_encoder, vae, denoiser, noise_scheduler, args, accelerator, step)
             if args.use_ema:
                 # Switch back to the original UNet parameters
                 ema_denoiser.restore(denoiser.parameters())
@@ -674,7 +766,7 @@ def train_ldm(args):
     #     variant=args.variant,
     # )
     # pipe.save_pretrained(args.output_dir)
-    accelerator.success("Training complete ✅  Model saved.")
+    accelerator.end_training()
     return 0
 
 
