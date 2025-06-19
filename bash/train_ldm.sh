@@ -48,28 +48,26 @@ VALIDATION_PROMPTS=(
 # --validation_prompts "${VALIDATION_PROMPTS[@]}"
 
 
-rm -rf /media/bryan/ssd01/expr/latent_diffusion/debug/run01
+rm -rf /media/bryan/ssd01/expr/latent_diffusion/debug/run02
 accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
---output_dir /media/bryan/ssd01/expr/latent_diffusion/debug/run01 \
+--output_dir /media/bryan/ssd01/expr/latent_diffusion/debug/run02 \
 --pretrained_clip $CLIP_MODEL \
 --hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
 --hf_model_subfolder "unet" \
 --hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
 --hf_scheduler_subfolder "scheduler" \
 --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
---train_batch_size 5 \
+--train_batch_size 2 \
 --gradient_accumulation_steps 2 \
 --lr_warmup_steps 100 \
---max_train_steps 101000 \
+--max_train_steps 300 \
 --checkpointing_steps 100 \
 --mixed_precision bf16 \
 --dataloader_num_workers 4 \
 --noise_offset 0.1 \
 --validation_steps 100 \
 --validation_prompts "${VALIDATION_PROMPTS[@]}" \
---seed 42 \
---resume_from_checkpoint /media/bryan/ssd01/expr/latent_diffusion/bs84_500k/run01/checkpoints/checkpoint_100000
-
+--seed 42
 
 # accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
 # --output_dir /media/bryan/ssd01/expr/latent_diffusion/bs84_500k/run02 \

@@ -18,7 +18,7 @@ from braceexpand import braceexpand
 import webdataset as wds
 
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed, GradientAccumulationPlugin
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -203,7 +203,7 @@ def parse_args():
     parser.add_argument(
         "--num_inference_steps",
         type=int,
-        default=20,
+        default=50,
         help="Number of inference steps to run for image generation.",
     )
     parser.add_argument(
@@ -505,6 +505,7 @@ def train_ldm(args):
         total_limit=args.checkpoint_total_limit,
         iteration=0,  # the current save iteration
     )
+    # https://huggingface.co/docs/accelerate/en/concept_guides/gradient_synchronization
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
         log_with="tensorboard",
@@ -627,15 +628,17 @@ def train_ldm(args):
 
     log_validation_prompts(accelerator, args.validation_prompts)
 
-    dataloader_wrapper = DataloaderMaxSteps(dataloader, args.max_train_steps, start_step=start_step)
-    for step, batch in (
-        progress_bar := tqdm(
-            enumerate(dataloader_wrapper, start=start_step),
-            initial=start_step,
-            total=args.max_train_steps,
-            desc="Training",
-        )
-    ):
+    dataloader_wrapper = DataloaderMaxSteps(
+        dataloader,
+        args.max_train_steps * args.gradient_accumulation_steps,
+        start_step=start_step * args.gradient_accumulation_steps,
+    )
+
+    # If args.gradient_accumulation_steps = 2, then 'step' is incremented every 2 micro-batches
+    progress_bar = tqdm(range(start_step, args.max_train_steps), desc="Training")
+    step = start_step
+    train_loss = 0.0
+    for batch in dataloader_wrapper:
         with accelerator.accumulate(diffusion_model):  # accumulate gradients diffusion_model.grad
             pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
             input_ids = batch["input_ids"].to(accelerator.device)
@@ -711,55 +714,53 @@ def train_ldm(args):
                     w = w / (snr + 1)
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3)) * w).mean()
 
+            train_loss += loss.detach().item() / args.gradient_accumulation_steps
             accelerator.backward(loss)
+
+        # end of accelerator.accumulate context
+        if accelerator.sync_gradients:  # True only on the final micro-batch
             accelerator.clip_grad_norm_(diffusion_model.parameters(), 1.0)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
 
-        # end of accelerator.accumulate context
+            current_lr = lr_scheduler.get_last_lr()[0]
+            logs = {
+                "loss/train": train_loss,
+                "lr": current_lr,
+            }
+            step += 1
+            accelerator.log(logs, step=step)
+            progress_bar.set_postfix(**logs)
+            progress_bar.update(1)
+            train_loss = 0.0
 
-        if args.use_ema:
-            ema_diffusion_model.step(diffusion_model.parameters())
-
-        current_lr = lr_scheduler.get_last_lr()[0]
-        logs = {
-            "loss/train": loss.detach().item(),
-            "lr": current_lr,
-        }
-        accelerator.log(logs, step=step)
-        progress_bar.set_postfix(**logs)
-
-        if step > 0 and (step % args.checkpointing_steps == 0 or step == args.max_train_steps - 1):
-            accelerator.project_configuration.iteration = step
-            accelerator.save_state()
-            accelerator.print(f"Checkpoint {step} saved")
-
-        # Validation
-        if step > 0 and args.validation_prompts and step % args.validation_steps == 0:
             if args.use_ema:
-                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                ema_diffusion_model.store(diffusion_model.parameters())
-                ema_diffusion_model.copy_to(diffusion_model.parameters())
-            log_validation(tokenizer, text_encoder, vae, diffusion_model, noise_scheduler, args, accelerator, step)
-            if args.use_ema:
-                # Switch back to the original UNet parameters
-                ema_diffusion_model.restore(diffusion_model.parameters())
+                ema_diffusion_model.step(diffusion_model.parameters())
 
-    # # Final save ------------------------------------------------------------- #
-    # diffusion_model = accelerator.unwrap_model(diffusion_model)
-    # if args.use_ema:
-    #     ema_diffusion_model.copy_to(diffusion_model.parameters())
+            if step > 1 and (step % args.checkpointing_steps == 0 or step == args.max_train_steps):
+                accelerator.project_configuration.iteration = step
+                accelerator.save_state()
+                # save EMA weights too
+                # torch.save(ema_diffusion_model.state_dict(), ...)
+                accelerator.print(f"Checkpoint {step} saved")
 
-    # pipe = StableDiffusionPipeline.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     text_encoder=text_encoder,
-    #     vae=vae,
-    #     diffusion_model=diffusion_model,
-    #     revision=args.revision,
-    #     variant=args.variant,
-    # )
-    # pipe.save_pretrained(args.output_dir)
+            # Validation
+            if step > 1 and args.validation_prompts and step % args.validation_steps == 0:
+                if args.use_ema:
+                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    ema_diffusion_model.store(diffusion_model.parameters())
+                    ema_diffusion_model.copy_to(diffusion_model.parameters())
+                log_validation(tokenizer, text_encoder, vae, diffusion_model, noise_scheduler, args, accelerator, step)
+                if args.use_ema:
+                    # Switch back to the original UNet parameters
+                    ema_diffusion_model.restore(diffusion_model.parameters())
+
+    # end of training loop
+    if args.use_ema:
+        diffusion_model = accelerator.unwrap_model(diffusion_model)
+        ema_diffusion_model.copy_to(diffusion_model.parameters())
+
     accelerator.end_training()
     return 0
 

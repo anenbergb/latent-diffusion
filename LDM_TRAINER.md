@@ -8,9 +8,12 @@ Custom implementations of the diffusion model architecture (e.g., U-Net or DiT) 
 ## LDM Trainer Concepts
 
 ### Gradient Accumulation
-Gradient accumulation is a technique where you can train on bigger batch sizes than your machine would normally be able to fit into memory. This is done by accumulating gradients over several batches, and only stepping the optimizer after a certain number of batches have been performed.
+Gradient accumulation is a technique where you can train on bigger batch sizes than your machine would normally be able to fit into memory.
+This is done by accumulating gradients over several batches, and only stepping the optimizer after a certain number of batches have been performed.
 
-https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
+- https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
+- https://huggingface.co/docs/accelerate/en/concept_guides/gradient_synchronization
+- https://huggingface.co/docs/accelerate/v1.8.0/en/package_reference/utilities#accelerate.utils.GradientAccumulationPlugin
 
 ### CLIP input caption standardization
 CLIP can only process at most "model_max_length" tokens (77 tokens) so the tokenizer is forced to truncate long text prompts and pad short text prompts such that the token length is always 77.
@@ -182,3 +185,6 @@ SD V1.4 [CompVis/stable-diffusion-v1-4](https://huggingface.co/CompVis/stable-di
 #### Stable Diffusion V2
 [stabilityai/stable-diffusion-2](https://huggingface.co/stabilityai/stable-diffusion-2)
 
+
+## Observations from initial training runs
+- a larger batch size stabilizes the gradients. Training on small batch size results in very noisy generated images.
