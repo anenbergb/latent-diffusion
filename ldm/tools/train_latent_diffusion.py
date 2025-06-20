@@ -18,7 +18,7 @@ from braceexpand import braceexpand
 import webdataset as wds
 
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed, GradientAccumulationPlugin
+from accelerate.utils import ProjectConfiguration, set_seed, TorchDynamoPlugin
 import diffusers
 from diffusers import (
     AutoencoderKL,
@@ -162,6 +162,10 @@ def parse_args():
     parser.add_argument("--use_ema", action="store_true", help="Maintain EMA of UNet params.")
     parser.add_argument("--foreach_ema", action="store_true", help="Use foreach-based EMA update (faster).")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Enable xformers.")
+    parser.add_argument(
+        "--enable_torch_compile", action="store_true", help="Enable torch.compile for the diffusion model."
+    )
+    parser.add_argument("--torch_dynamo_reset", action="store_true", help="Reset torch dynamo state before training.")
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -441,7 +445,7 @@ def generate(
 
     # Latents -> image space through VAE decoder
     latents = latents / vae.config.scaling_factor  # SD latent scaling
-    image = vae.decode(latents).sample
+    image = vae.decode(latents, return_dict=False)[0]
 
     # Post-process [-1,1] -> [0,1] -> [0,255]
     image = (image / 2 + 0.5).clamp(0, 1)
@@ -518,6 +522,24 @@ def train_ldm(args):
         total_limit=args.checkpoint_total_limit,
         iteration=0,  # the current save iteration
     )
+    dynamo_plugin = TorchDynamoPlugin(
+        backend="inductor",
+        mode="max-autotune",
+        fullgraph=False,
+        use_regional_compilation=True,
+    )
+    # https://huggingface.co/docs/diffusers/en/tutorials/fast_diffusion#torchcompile
+    if args.enable_torch_compile:
+        print("Enabling torch.compile for the diffusion model...")
+        torch._inductor.config.conv_1x1_as_mm = True
+        torch._inductor.config.coordinate_descent_tuning = True
+        torch._inductor.config.epilogue_fusion = False
+        torch._inductor.config.coordinate_descent_check_all_directions = True
+        # torch._inductor.config.triton.cudagraphs = False
+        if args.torch_dynamo_reset:
+            print("Resetting torch dynamo state...")
+            torch._dynamo.reset()
+
     # https://huggingface.co/docs/accelerate/en/concept_guides/gradient_synchronization
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
@@ -526,6 +548,7 @@ def train_ldm(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         split_batches=False,
         step_scheduler_with_optimizer=False,
+        dynamo_plugin=dynamo_plugin if args.enable_torch_compile else None,
     )
     accelerator.init_trackers(os.path.basename(args.output_dir))
 
@@ -536,6 +559,9 @@ def train_ldm(args):
     vae = AutoencoderKL.from_pretrained(args.pretrained_vae).eval()
     vae.requires_grad_(False)
 
+    vae.to(memory_format=torch.channels_last)
+    vae = torch.compile(vae, backend="inductor", mode="max-autotune", fullgraph=True)
+
     if args.hf_model_repo_id:
         diffusion_model = load_hf_model_from_config(
             repo_id=args.hf_model_repo_id,
@@ -543,6 +569,7 @@ def train_ldm(args):
         )
     else:
         raise NotImplementedError("Loading custom diffusion models is not implemented yet.")
+    diffusion_model.to(memory_format=torch.channels_last)
 
     if args.hf_scheduler_repo_id:
         noise_scheduler = load_hf_scheduler_from_config(
@@ -554,6 +581,7 @@ def train_ldm(args):
 
     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     if args.enable_xformers_memory_efficient_attention:
+        assert args.enable_torch_compile is False, "xformers and torch.compile are not compatible yet."
         diffusion_model.enable_xformers_memory_efficient_attention()
     diffusion_model.train()
 

@@ -71,23 +71,27 @@ VALIDATION_PROMPTS=(
 # --text_conditioning_dropout 0.1 \
 # --resume_from_checkpoint /media/bryan/ssd01/expr/latent_diffusion/bs84_500k/run01/checkpoints/checkpoint_100000
 
+# --output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs252_200k \
+
+# export TORCH_LOGS="all"
 accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
---output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs252_200k \
+--output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs250_200k \
 --pretrained_clip $CLIP_MODEL \
 --hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
 --hf_model_subfolder "unet" \
 --hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
 --hf_scheduler_subfolder "scheduler" \
 --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
---train_batch_size 42 \
---gradient_accumulation_steps 6 \
+--enable_torch_compile --use_8bit_adam \
+--train_batch_size 50 \
+--gradient_accumulation_steps 5 \
 --lr_warmup_steps 10000 \
 --max_train_steps 200000 \
---checkpointing_steps 5000 \
+--checkpointing_steps 1000 \
 --mixed_precision bf16 \
 --dataloader_num_workers 2 \
 --noise_offset 0.1 \
---validation_steps 5000 \
+--validation_steps 1000 \
 --validation_prompts "${VALIDATION_PROMPTS[@]}" \
 --generations_per_val_prompt 3 \
 --text_conditioning_dropout 0.1 \

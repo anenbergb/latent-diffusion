@@ -239,5 +239,10 @@ SD V1.4 [CompVis/stable-diffusion-v1-4](https://huggingface.co/CompVis/stable-di
 [stabilityai/stable-diffusion-2](https://huggingface.co/stabilityai/stable-diffusion-2)
 
 
+## Speeding up Runtime
+- https://huggingface.co/docs/diffusers/en/tutorials/fast_diffusion
+- https://pytorch.org/blog/accelerating-generative-ai-3/
+
+
 ## Observations from initial training runs
 - a larger batch size stabilizes the gradients. Training on small batch size results in very noisy generated images.
