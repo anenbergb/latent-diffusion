@@ -169,6 +169,12 @@ def parse_args():
         choices=("epsilon", "v_prediction"),
         help="The prediction_type that shall be used for training.Choose between 'epsilon' or 'v_prediction'",
     )
+    parser.add_argument(
+        "--text_conditioning_dropout",
+        type=float,
+        default=0.1,
+        help="Drop the text-conditioning embeddings with this probability (0.0 = no dropout).",
+    )
 
     # --- misc / logging / checkpoints -------------------------------------- #
     parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save every N steps.")
@@ -200,6 +206,13 @@ def parse_args():
         default=None,
         help="Prompts to visualize during validation.",
     )
+    parser.add_argument(
+        "--generations_per_val_prompt",
+        type=int,
+        default=1,
+        help="Number of images to generate per validation prompt.",
+    )
+
     parser.add_argument(
         "--num_inference_steps",
         type=int,
@@ -434,10 +447,8 @@ def generate(
     image = (image / 2 + 0.5).clamp(0, 1)
     image = (255 * image.to(device="cpu")).to(torch.uint8).squeeze(0)
     if return_type == "pil":
-        image = image.permute(0, 2, 3, 1).numpy()[0]
-        return Image.fromarray((image * 255).astype("uint8"))
-    else:
-        return image
+        return Image.fromarray(image.permute(1, 2, 0).numpy())
+    return image
 
 
 def log_validation(
@@ -455,24 +466,26 @@ def log_validation(
     images = []
     for prompt in args.validation_prompts:
         with accelerator.autocast():
-            image = generate(
-                tokenizer,
-                text_encoder,
-                vae,
-                diffusion_model,
-                noise_scheduler,
-                prompt=prompt,
-                num_inference_steps=args.num_inference_steps,
-                guidance_scale=args.classifier_free_guidance_scale,
-                height=args.resolution,
-                width=args.resolution,
-                seed=args.seed,
-                device=accelerator.device,
-                return_type="torch",
-            )
-            images.append(image)
+            for i in range(args.generations_per_val_prompt):
+                image = generate(
+                    tokenizer,
+                    text_encoder,
+                    vae,
+                    diffusion_model,
+                    noise_scheduler,
+                    prompt=prompt,
+                    num_inference_steps=args.num_inference_steps,
+                    guidance_scale=args.classifier_free_guidance_scale,
+                    height=args.resolution,
+                    width=args.resolution,
+                    seed=args.seed + i if args.seed is not None else None,
+                    device=accelerator.device,
+                    return_type="torch",
+                )
+                images.append(image)
 
-    image_grid = make_grid(images, nrow=3, padding=0, value_range=(0, 255))  # (C,H,W)
+    nrow = args.generations_per_val_prompt if args.generations_per_val_prompt > 1 else 3
+    image_grid = make_grid(images, nrow=nrow, padding=0, value_range=(0, 255))  # (C,H,W)
     image_grid_pil = Image.fromarray(image_grid.permute(1, 2, 0).numpy())
     image_grid_pil.save(Path(args.output_dir) / f"val_images_step_{train_step}.png")
     tracker = accelerator.get_tracker("tensorboard")
@@ -634,6 +647,12 @@ def train_ldm(args):
         start_step=start_step * args.gradient_accumulation_steps,
     )
 
+    # Prepare unconditional (null) embedding once to support text-conditioning dropout
+    null_text_input_ids = tokenizer(
+        [""], max_length=tokenizer.model_max_length, padding="max_length", return_tensors="pt"
+    ).input_ids.to(accelerator.device)
+    null_text_emb = text_encoder(null_text_input_ids, return_dict=False)[0].to(weight_dtype)
+
     # If args.gradient_accumulation_steps = 2, then 'step' is incremented every 2 micro-batches
     progress_bar = tqdm(range(start_step, args.max_train_steps), desc="Training")
     step = start_step
@@ -679,6 +698,14 @@ def train_ldm(args):
                 # https://docs.pytorch.org/docs/stable/amp.html#cuda-ops-that-can-autocast-to-float32
 
                 enc_h = text_encoder(input_ids, return_dict=False)[0].to(weight_dtype)
+
+                # randomly drop text conditioning
+                if args.text_conditioning_dropout > 0.0:
+                    # Create a mask for dropping text conditioning
+                    drop_mask = torch.rand(input_ids.shape[0], device=input_ids.device) < args.text_conditioning_dropout
+                    if drop_mask.any():
+                        # Replace the dropped text embeddings with null embedding
+                        enc_h[drop_mask] = null_text_emb
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":

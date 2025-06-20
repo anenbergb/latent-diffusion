@@ -171,6 +171,59 @@ The performance is greatly improved by applying classifier-free diffusion guidan
 
 ## LDM Training Configuration
 ### Reference Model Configs
+
+#### Latent Diffusion LDM-8 model
+The original Latent Diffusion Model (LDM-8) from 
+
+The tables in the Appendix of the original [LDM paper](https://arxiv.org/abs/2112.10752) show that a much higher batch size of 680 was required to train a conditional LDM-8 
+for text-to-image generation on the LAION dataset as compared to the relatively small 96 batch size used to train an unconditional LDM-8 on the CelebA dataset.
+
+<img src="https://github.com/user-attachments/assets/74740ad5-1883-4bfa-8d12-814088e86176" width="800"/>
+
+Conditional LDMs require very large batch sizes (e.g., 680–1200) primarily due to:
+
+1. Conditioning Signal Variability
+
+- Text prompts or class labels introduce extra variance in the input space.
+- The model needs to see many diverse conditionings per step to learn good alignments.
+- Larger batches better capture that diversity in each gradient update.
+
+2. Stability in Classifier-Free Guidance (CFG)
+
+- Text-to-image models often use classifier-free guidance, which includes both:
+  - Conditional (text-encoded) samples
+  - Unconditional (empty prompt) samples
+- Small batch sizes make the unconditional path gradients noisy, leading to unstable training.
+- CFG benefits from large batches for stable mean gradients.
+
+3. Better Signal-to-Noise Ratio in Latent Space
+
+- Latent space training is more sensitive to noise.
+- Small changes in the latent space can have outsized effects on the decoded image.
+- Larger batch sizes stabilize training by reducing the variance of gradients.
+
+4. Empirical Scaling Laws
+
+- The LDM paper (and related works like Imagen, DALL·E 2) observed that:
+  - Larger batch sizes improve sample quality
+  - Help reduce overfitting
+  - Enable faster convergence
+
+
+The LDM-8 on CelebA was Trained with Batch Size 96 because:
+
+- It's an unconditional generation task — no text or label conditioning.
+- The input distribution is simpler (mostly faces).
+- Smaller batch sizes suffice because:
+  - No CFG is used
+  - Less variance in input
+  - Lower risk of overfitting
+  - Training is more stable
+
+Summary
+- Conditional LDMs (especially text-to-image) benefit from large batch sizes ≥ 512
+- Unconditional models can often train well with batch sizes 64–128
+
 #### Stable Diffusion V1 - V1.5
 SD V1.1 [CompVis/stable-diffusion-v1-1](https://huggingface.co/CompVis/stable-diffusion-v1-1)
 - trained for 237k steps at resolution 256x256 on laion2B-en, followed by 194k steps at resolution 512x512 on laion-high-resolution (170M examples from LAION-5B with resolution >= 1024x1024)
