@@ -648,11 +648,14 @@ def train_ldm(args):
         path = args.resume_from_checkpoint
         if args.resume_from_checkpoint == "latest":
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("_")[1]))
-            path = os.path.join(args.output_dir, dirs[-1]) if len(dirs) > 0 else None
-
+            checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+            if os.path.exists(checkpoint_dir):
+                dirs = os.listdir(checkpoint_dir)
+                dirs = [d for d in dirs if d.startswith("checkpoint")]
+                dirs = sorted(dirs, key=lambda x: int(x.split("_")[1]))
+                path = os.path.join(checkpoint_dir, dirs[-1]) if len(dirs) > 0 else None
+            else:
+                path = None
         # path should be formatated as /path/to/output_dir/checkpoints/checkpoint_XXXXX
         if path is None or not os.path.exists(path):
             accelerator.print(
@@ -661,9 +664,10 @@ def train_ldm(args):
             start_step = 0
         else:
             # Restore diffusion_model weights, optimizer state_dict, scheduler state, random states
-            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.print(f"Loading weights from checkpoint {path}")
             accelerator.load_state(path)
             start_step = int(path.split("_")[-1])
+            accelerator.print(f"Resuming training from step {start_step}")
     else:
         start_step = 0
 
@@ -682,7 +686,7 @@ def train_ldm(args):
     null_text_emb = text_encoder(null_text_input_ids, return_dict=False)[0].to(weight_dtype)
 
     # If args.gradient_accumulation_steps = 2, then 'step' is incremented every 2 micro-batches
-    progress_bar = tqdm(range(start_step, args.max_train_steps), desc="Training")
+    progress_bar = tqdm(range(0, args.max_train_steps), initial=start_step, desc="Training")
     step = start_step
     train_loss = 0.0
     for batch in dataloader_wrapper:

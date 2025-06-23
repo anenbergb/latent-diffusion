@@ -95,4 +95,5 @@ accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusio
 --validation_prompts "${VALIDATION_PROMPTS[@]}" \
 --generations_per_val_prompt 3 \
 --text_conditioning_dropout 0.1 \
---seed 42
+--seed 42 \
+--resume_from_checkpoint latest
