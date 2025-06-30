@@ -15,7 +15,6 @@ class UNetConfig:
     cross_attention_dim: int = field(default=768)
     in_channels: int = field(default=4)
     layers_per_block: int = field(default=2)
-    norm_eps: float = field(default=1e-5)
     norm_num_groups: float = field(default=32)
     out_channels: int = field(default=4)
     # Height and width of input/output sample.
@@ -30,7 +29,6 @@ class UNet(nn.Module):
         cross_attention_dim: int = 768,
         in_channels: int = 4,
         layers_per_block: int = 2,
-        norm_eps: float = 1e-5,
         norm_num_groups: float = 32,
         out_channels: int = 4,
         # Height and width of input/output sample.
@@ -92,12 +90,127 @@ def get_time_embed(sample: torch.Tensor, timestep: Union[torch.Tensor, float, in
     return t_emb
 
 
-class CrossAttnBlock(nn.Module):
+class CrossAttnDownBlock(nn.Module):
     def __init__(
         self,
+        in_channels: int,
+        out_channels: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        transformer_layers_per_block: int = 1,
+        resnet_groups: int = 32,
+        num_attention_heads: int = 8,
+        cross_attention_dim: int = 1280,
+        downsample_padding: int = 1,
+        add_downsample: bool = True,
+        dual_cross_attention: bool = False,
+        use_linear_projection: bool = False,
+        only_cross_attention: bool = False,
+        upcast_attention: bool = False,
+        attention_type: str = "default",
     ):
         super().__init__()
-        return
+        resnets = []
+        attentions = []
+
+        for i in range(num_layers):
+            in_channels = in_channels if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                )
+            )
+            attentions.append(
+                TransformerBlock(
+                    in_channels=out_channels,
+                    num_attention_heads=num_attention_heads,
+                    attention_head_dim=out_channels // num_attention_heads,
+                    cross_attention_dim=cross_attention_dim,
+                    num_layers=transformer_layers_per_block[i],
+                    norm_num_groups=resnet_groups,
+                    use_linear_projection=use_linear_projection,
+                    only_cross_attention=only_cross_attention,
+                    upcast_attention=upcast_attention,
+                    attention_type=attention_type,
+                )
+            )
+
+
+class TransformerModel(nn.Module):
+    """
+
+    Parameters:
+        in_channels (`int`):
+            The number of channels in the input and output
+        num_attention_heads (`int`, defaults to 16): The number of heads to use for multi-head attention.
+        num_layers (`int`, defaults to 1): The number of layers of Transformer blocks to use.
+        cross_attention_dim (`int`): The number of `encoder_hidden_states` dimensions to use.
+        dropout (`float`, defaults to 0.0): The dropout probability to use.
+        norm_num_groups (`int`)
+        feed_forward_mult (`int`, defaults to 4): The factor to scale out the feed forward inner dimension. 8/3 is a good default for LLMs.
+        activation_fn (`str`, defaults to `"geglu"`): Activation function to use in feed-forward.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 320,
+        num_attention_heads: int = 16,
+        num_layers: int = 1,
+        cross_attention_dim: int = 768,
+        dropout: float = 0.0,
+        norm_num_groups: int = 32,
+        feed_forward_mult: int = 4,
+        activation_fn: str = "geglu",
+    ):
+        super().__init__()
+        assert in_channels % num_attention_heads == 0, "in_channels must be divisible by num_attention_heads"
+        self.norm = nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, affine=True)
+        self.proj_in = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.transformer_blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    in_channels=in_channels,
+                    num_attention_heads=num_attention_heads,
+                    cross_attention_dim=cross_attention_dim,
+                    dropout=dropout,
+                    activation_fn=activation_fn,
+                    feed_forward_mult=feed_forward_mult,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.proj_out = torch.nn.Conv2d(self.inner_dim, self.out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ):
+        """
+        Example shape:
+            hidden_states (N,320,32,32)
+            encoder_hidden_states (N,77,768)
+        """
+        height, width = hidden_states.shape[-2:]
+        x = self.proj_in(self.norm(hidden_states))
+        x = rearrange(
+            x,
+            "batch dim height width -> batch (height width) dim",
+        )
+        for block in self.transformer_blocks:
+            x = block(x, encoder_hidden_states)
+        x = rearrange(
+            x,
+            "batch (height width) dim -> batch dim height width",
+            height=height,
+            width=width,
+        )
+        return self.proj_out(x)
 
 
 class TransformerBlock(nn.Module):
@@ -105,59 +218,57 @@ class TransformerBlock(nn.Module):
     Transformer block.
 
     Parameters:
-        dim (`int`): The number of channels in the input and output.
+        in_channels (`int`): The number of channels in the input and output.
         num_attention_heads (`int`): The number of heads to use for multi-head attention.
-        attention_head_dim (`int`): The number of channels in each head.
-        cross_attention_dim (`int`, *optional*): The size of the encoder_hidden_states vector for cross attention.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        norm_eps (`float`, *optional*, defaults to 1e-5): The epsilon value for the layer normalization.
-        feed_forward_mult (`int`, *optional*, defaults to 4): The factor to scale out the feed forward inner dimension. 8/3 is a good default for LLMs.
+        cross_attention_dim (`int`): The size of the encoder_hidden_states vector for cross attention.
+        dropout (`float`, defaults to 0.0): The dropout probability to use.
+        activation_fn (`str`, defaults to `"geglu"`): Activation function to be used in feed-forward.
+        feed_forward_mult (`int`, defaults to 4): The factor to scale out the feed forward inner dimension. 8/3 is a good default for LLMs.
     """
 
     def __init__(
         self,
-        dim: int,
+        in_channels: int,
         num_attention_heads: int,
-        attention_head_dim: int,
         cross_attention_dim: int,
         dropout=0.0,
         activation_fn: str = "geglu",
-        norm_eps: float = 1e-5,
         feed_forward_mult: int = 4,
     ):
         super().__init__()
-        attention_bias = False
-        self.norm1 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
-        self.norm2 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
+        assert in_channels % num_attention_heads == 0, "in_channels must be divisible by num_attention_heads"
+        self.attention_head_dim = in_channels // num_attention_heads
+
+        self.norm1 = nn.LayerNorm(in_channels)
+        self.norm2 = nn.LayerNorm(in_channels)
 
         self.attn1 = Attention(
-            query_dim=dim,
+            query_dim=in_channels,
             num_heads=num_attention_heads,
-            dim_head=attention_head_dim,
+            dim_head=self.attention_head_dim,
             dropout=dropout,
         )
         self.attn2 = Attention(
-            query_dim=dim,
-            dim_head=attention_head_dim,
+            query_dim=in_channels,
+            dim_head=self.attention_head_dim,
             dropout=dropout,
             cross_attention_dim=cross_attention_dim,
         )
 
-        ff_dim = int(feed_forward_mult * dim)
+        ff_dim = int(feed_forward_mult * in_channels)
         # make the SwiGLU and GEGLU the only options for activation funtions
         if activation_fn == "geglu":
-            act_fn = GEGLU(dim, ff_dim, bias=True)
+            act_fn = GEGLU(in_channels, ff_dim, bias=True)
         elif activation_fn == "swiglu":
-            act_fn = SwiGLU(dim, ff_dim, bias=True)
+            act_fn = SwiGLU(in_channels, ff_dim, bias=True)
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 
         self.feed_forward = nn.Sequential(
-            nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True),
+            nn.LayerNorm(in_channels, elementwise_affine=True),
             act_fn,
             nn.Dropout(dropout),
-            nn.Linear(ff_dim, dim, bias=True),
+            nn.Linear(ff_dim, in_channels, bias=True),
         )
 
     def forward(
@@ -184,13 +295,13 @@ class Attention(nn.Module):
     Parameters:
         query_dim (`int`):
             The number of channels in the query.
-        num_heads (`int`,  *optional*, defaults to 8):
+        num_heads (`int`,, defaults to 8):
             The number of heads to use for multi-head attentions.
-        dim_head (`int`,  *optional*, defaults to 64):
+        dim_head (`int`,, defaults to 64):
             The number of channels in each head.
-        dropout (`float`, *optional*, defaults to 0.0):
+        dropout (`float`, defaults to 0.0):
             The dropout probability to use.
-        cross_attention_dim (`int`, *optional*):
+        cross_attention_dim (`int`):
             The number of channels in the encoder_hidden_states. If not given, defaults to `query_dim`.
     """
 
@@ -271,20 +382,19 @@ class ResnetBlock(nn.Module):
         in_channels: int,
         out_channels: Optional[int] = None,
         temb_channels: int = 512,
-        groups: int = 32,
-        eps: float = 1e-6,
+        norm_num_groups: int = 32,
         dropout: float = 0.0,
     ):
         super().__init__()
         out_channels = in_channels if out_channels is None else out_channels
         self.visual = nn.Sequential(
-            nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True),
+            nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels),
             nn.SiLU(),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
         self.time = nn.Sequential(nn.SiLU(), nn.Linear(temb_channels, out_channels, bias=True))
         self.layers = nn.Sequential(
-            nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps, affine=True),
+            nn.GroupNorm(num_groups=norm_num_groups, num_channels=out_channels),
             nn.SiLU(),
             nn.Dropout(dropout),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
