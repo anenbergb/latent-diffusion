@@ -99,21 +99,16 @@ class CrossAttnDownBlock(nn.Module):
         dropout: float = 0.0,
         num_layers: int = 1,
         transformer_layers_per_block: int = 1,
-        resnet_groups: int = 32,
+        norm_num_groups: int = 32,
         num_attention_heads: int = 8,
         cross_attention_dim: int = 1280,
+        feed_forward_mult: int = 4,
+        activation_fn: str = "geglu",
         downsample_padding: int = 1,
-        add_downsample: bool = True,
-        dual_cross_attention: bool = False,
-        use_linear_projection: bool = False,
-        only_cross_attention: bool = False,
-        upcast_attention: bool = False,
-        attention_type: str = "default",
     ):
         super().__init__()
-        resnets = []
-        attentions = []
-
+        resnets = nn.ModuleList()
+        attentions = nn.ModuleList()
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
             resnets.append(
@@ -121,7 +116,7 @@ class CrossAttnDownBlock(nn.Module):
                     in_channels=in_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
-                    groups=resnet_groups,
+                    norm_num_groups=norm_num_groups,
                     dropout=dropout,
                 )
             )
@@ -129,16 +124,106 @@ class CrossAttnDownBlock(nn.Module):
                 TransformerBlock(
                     in_channels=out_channels,
                     num_attention_heads=num_attention_heads,
-                    attention_head_dim=out_channels // num_attention_heads,
+                    num_layers=transformer_layers_per_block,
                     cross_attention_dim=cross_attention_dim,
-                    num_layers=transformer_layers_per_block[i],
-                    norm_num_groups=resnet_groups,
-                    use_linear_projection=use_linear_projection,
-                    only_cross_attention=only_cross_attention,
-                    upcast_attention=upcast_attention,
-                    attention_type=attention_type,
+                    dropout=dropout,
+                    norm_num_groups=norm_num_groups,
+                    feed_forward_mult=feed_forward_mult,
+                    activation_fn=activation_fn,
                 )
             )
+        self.downsample = Downsample2D(
+            out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        output_states = []
+
+        blocks = list(zip(self.resnets, self.attentions))
+
+        for i, (resnet, attn) in enumerate(blocks):
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = attn(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+            output_states.append(hidden_states)
+
+        hidden_states = self.downsample(hidden_states)
+        output_states.append(hidden_states)
+        return hidden_states, tuple(output_states)
+
+
+class CrossAttnUpBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        prev_output_channel: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        transformer_layers_per_block: int = 1,
+        norm_num_groups: int = 32,
+        num_attention_heads: int = 8,
+        cross_attention_dim: int = 1280,
+        feed_forward_mult: int = 4,
+        activation_fn: str = "geglu",
+    ):
+        super().__init__()
+        resnets = nn.ModuleList()
+        attentions = nn.ModuleList()
+        for i in range(num_layers):
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+
+            resnets.append(
+                ResnetBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    norm_num_groups=norm_num_groups,
+                    dropout=dropout,
+                )
+            )
+            attentions.append(
+                TransformerBlock(
+                    in_channels=out_channels,
+                    num_attention_heads=num_attention_heads,
+                    num_layers=transformer_layers_per_block,
+                    cross_attention_dim=cross_attention_dim,
+                    dropout=dropout,
+                    norm_num_groups=norm_num_groups,
+                    feed_forward_mult=feed_forward_mult,
+                    activation_fn=activation_fn,
+                )
+            )
+        self.upsample = Upsample2D(out_channels, use_conv=True, out_channels=out_channels)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        res_hidden_states_tuple: Tuple[torch.Tensor, ...],
+        temb: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for resnet, attn in zip(self.resnets, self.attentions):
+            res_hidden_states = res_hidden_states_tuple[-1]
+            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = attn(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+        hidden_states = self.upsample(hidden_states)
+        return hidden_states
 
 
 class TransformerModel(nn.Module):
