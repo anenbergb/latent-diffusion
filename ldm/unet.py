@@ -3,6 +3,8 @@ from diffusers.models.embeddings import get_timestep_embedding
 import torch
 from torch import nn
 from dataclasses import dataclass, field
+from jaxtyping import Float
+from einops import einsum, rearrange
 
 
 @dataclass
@@ -98,6 +100,195 @@ class CrossAttnBlock(nn.Module):
         return
 
 
+class TransformerBlock(nn.Module):
+    r"""
+    A basic Transformer block.
+
+    Parameters:
+        dim (`int`): The number of channels in the input and output.
+        num_attention_heads (`int`): The number of heads to use for multi-head attention.
+        attention_head_dim (`int`): The number of channels in each head.
+        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
+        cross_attention_dim (`int`, *optional*): The size of the encoder_hidden_states vector for cross attention.
+        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
+        num_embeds_ada_norm (:
+            obj: `int`, *optional*): The number of diffusion steps used during training. See `Transformer2DModel`.
+        attention_bias (:
+            obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
+        only_cross_attention (`bool`, *optional*):
+            Whether to use only cross-attention layers. In this case two cross attention layers are used.
+        double_self_attention (`bool`, *optional*):
+            Whether to use two self-attention layers. In this case no cross attention layers are used.
+        upcast_attention (`bool`, *optional*):
+            Whether to upcast the attention computation to float32. This is useful for mixed precision training.
+        norm_elementwise_affine (`bool`, *optional*, defaults to `True`):
+            Whether to use learnable elementwise affine parameters for normalization.
+        norm_type (`str`, *optional*, defaults to `"layer_norm"`):
+            The normalization layer to use. Can be `"layer_norm"`, `"ada_norm"` or `"ada_norm_zero"`.
+        final_dropout (`bool` *optional*, defaults to False):
+            Whether to apply a final dropout after the last feed-forward layer.
+        attention_type (`str`, *optional*, defaults to `"default"`):
+            The type of attention to use. Can be `"default"` or `"gated"` or `"gated-text-image"`.
+        positional_embeddings (`str`, *optional*, defaults to `None`):
+            The type of positional embeddings to apply to.
+        num_positional_embeddings (`int`, *optional*, defaults to `None`):
+            The maximum number of positional embeddings to apply.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        cross_attention_dim: int,
+        dropout=0.0,
+        activation_fn: str = "geglu",
+        only_cross_attention: bool = False,
+        double_self_attention: bool = False,
+        upcast_attention: bool = False,
+        norm_elementwise_affine: bool = True,
+        norm_type: str = "layer_norm",  # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
+        norm_eps: float = 1e-5,
+        final_dropout: bool = False,
+        attention_type: str = "default",
+        positional_embeddings: Optional[str] = None,
+        num_positional_embeddings: Optional[int] = None,
+        ada_norm_continous_conditioning_embedding_dim: Optional[int] = None,
+        ada_norm_bias: Optional[int] = None,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+        attention_bias = False
+        self.norm1 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
+        self.norm2 = nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True)
+
+        self.attn1 = Attention(
+            query_dim=dim,
+            heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            dropout=dropout,
+        )
+        self.attn2 = Attention(
+            query_dim=dim,
+            cross_attention_dim=cross_attention_dim,
+            heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            dropout=dropout,
+        )
+
+        # make the SwiGLU and GEGLU the only options for activation funtions
+        if activation_fn == "geglu":
+            act_fn = GEGLU(dim, inner_dim, bias=True)
+        elif activation_fn == "swiglu":
+            act_fn = SwiGLU(dim, inner_dim, bias=True)
+        else:
+            raise ValueError(f"Unsupported activation function: {activation_fn}")
+        self.feed_forward = nn.Sequential(nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True), act_fn)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+    ) -> torch.Tensor:
+        """
+        Example sizes:
+            hidden_states (N,1204,320)
+            encoder_hidden_states (N,77,768)
+            timestep: (N,1280)
+        """
+
+
+class Attention(nn.Module):
+    r"""
+    cross attention layer.
+
+    Parameters:
+        query_dim (`int`):
+            The number of channels in the query.
+        num_heads (`int`,  *optional*, defaults to 8):
+            The number of heads to use for multi-head attentions.
+        dim_head (`int`,  *optional*, defaults to 64):
+            The number of channels in each head.
+        dropout (`float`, *optional*, defaults to 0.0):
+            The dropout probability to use.
+        cross_attention_dim (`int`, *optional*):
+            The number of channels in the encoder_hidden_states. If not given, defaults to `query_dim`.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        cross_attention_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.query_dim = query_dim
+        self.num_heads = num_heads
+        self.dim_head = dim_head
+        self.dropout = dropout
+        self.cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
+
+        self.inner_dim = dim_head * num_heads
+
+        self.q_proj = Linear(query_dim, self.inner_dim, bias=False)
+        self.kv_proj = Linear(self.cross_attention_dim, self.inner_dim * 2, bias=False)
+
+        self.output_proj = nn.Sequential(
+            Linear(self.inner_dim, self.inner_dim, bias=True),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        in_features: Float[torch.Tensor, " ... query_seq_len query_dim"],
+        cross_features: Optional[Float[torch.Tensor, " ... cross_seq_len cross_dim"]] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for the attention mechanism.
+
+        Returns:
+            Float[Tensor, " ... query_seq_len d_out"]: Output tensor after applying attention.
+        """
+        if cross_features is None:
+            cross_features = in_features
+
+        q = self.q_proj(in_features)  # (..., query_seq_len, inner_dim)
+        kv = self.kv_proj(cross_features)  # (..., cross_seq_len, inner_dim)
+        k, v = kv.split(self.inner_dim, dim=-1)  # (..., cross_seq_len, inner_dim) x 2
+
+        q = rearrange(
+            q,
+            "batch query_seq_len (num_heads dim_head) -> batch num_heads query_seq_len dim_head",
+            dim_head=self.dim_head,
+            num_heads=self.num_heads,
+        )
+        k = rearrange(
+            k,
+            "batch cross_seq_len (num_heads dim_head) -> batch num_heads cross_seq_len dim_head",
+            dim_head=self.dim_head,
+            num_heads=self.num_heads,
+        )
+        v = rearrange(
+            v,
+            "batch cross_seq_len (num_heads dim_head) -> batch num_heads cross_seq_len dim_head",
+            dim_head=self.dim_head,
+            num_heads=self.num_heads,
+        )
+
+        attention = nn.functional.scaled_dot_product_attention(q, k, v)
+        attention = rearrange(
+            attention, "batch num_heads query_seq_len dim_head -> batch query_seq_len (num_heads dim_head)"
+        )
+        # output projection
+        out = self.output_proj(attention)
+        return out
+
+
 class ResnetBlock(nn.Module):
     def __init__(
         self,
@@ -106,6 +297,7 @@ class ResnetBlock(nn.Module):
         temb_channels: int = 512,
         groups: int = 32,
         eps: float = 1e-6,
+        dropout: float = 0.0,
     ):
         super().__init__()
         out_channels = in_channels if out_channels is None else out_channels
@@ -118,6 +310,7 @@ class ResnetBlock(nn.Module):
         self.layers = nn.Sequential(
             nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps, affine=True),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
         self.conv_shortcut = None
