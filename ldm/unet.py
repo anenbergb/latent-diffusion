@@ -102,37 +102,17 @@ class CrossAttnBlock(nn.Module):
 
 class TransformerBlock(nn.Module):
     r"""
-    A basic Transformer block.
+    Transformer block.
 
     Parameters:
         dim (`int`): The number of channels in the input and output.
         num_attention_heads (`int`): The number of heads to use for multi-head attention.
         attention_head_dim (`int`): The number of channels in each head.
-        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
         cross_attention_dim (`int`, *optional*): The size of the encoder_hidden_states vector for cross attention.
+        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
         activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        num_embeds_ada_norm (:
-            obj: `int`, *optional*): The number of diffusion steps used during training. See `Transformer2DModel`.
-        attention_bias (:
-            obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
-        only_cross_attention (`bool`, *optional*):
-            Whether to use only cross-attention layers. In this case two cross attention layers are used.
-        double_self_attention (`bool`, *optional*):
-            Whether to use two self-attention layers. In this case no cross attention layers are used.
-        upcast_attention (`bool`, *optional*):
-            Whether to upcast the attention computation to float32. This is useful for mixed precision training.
-        norm_elementwise_affine (`bool`, *optional*, defaults to `True`):
-            Whether to use learnable elementwise affine parameters for normalization.
-        norm_type (`str`, *optional*, defaults to `"layer_norm"`):
-            The normalization layer to use. Can be `"layer_norm"`, `"ada_norm"` or `"ada_norm_zero"`.
-        final_dropout (`bool` *optional*, defaults to False):
-            Whether to apply a final dropout after the last feed-forward layer.
-        attention_type (`str`, *optional*, defaults to `"default"`):
-            The type of attention to use. Can be `"default"` or `"gated"` or `"gated-text-image"`.
-        positional_embeddings (`str`, *optional*, defaults to `None`):
-            The type of positional embeddings to apply to.
-        num_positional_embeddings (`int`, *optional*, defaults to `None`):
-            The maximum number of positional embeddings to apply.
+        norm_eps (`float`, *optional*, defaults to 1e-5): The epsilon value for the layer normalization.
+        feed_forward_mult (`int`, *optional*, defaults to 4): The factor to scale out the feed forward inner dimension. 8/3 is a good default for LLMs.
     """
 
     def __init__(
@@ -143,21 +123,8 @@ class TransformerBlock(nn.Module):
         cross_attention_dim: int,
         dropout=0.0,
         activation_fn: str = "geglu",
-        only_cross_attention: bool = False,
-        double_self_attention: bool = False,
-        upcast_attention: bool = False,
-        norm_elementwise_affine: bool = True,
-        norm_type: str = "layer_norm",  # 'layer_norm', 'ada_norm', 'ada_norm_zero', 'ada_norm_single', 'ada_norm_continuous', 'layer_norm_i2vgen'
         norm_eps: float = 1e-5,
-        final_dropout: bool = False,
-        attention_type: str = "default",
-        positional_embeddings: Optional[str] = None,
-        num_positional_embeddings: Optional[int] = None,
-        ada_norm_continous_conditioning_embedding_dim: Optional[int] = None,
-        ada_norm_bias: Optional[int] = None,
-        ff_inner_dim: Optional[int] = None,
-        ff_bias: bool = True,
-        attention_out_bias: bool = True,
+        feed_forward_mult: int = 4,
     ):
         super().__init__()
         attention_bias = False
@@ -166,32 +133,37 @@ class TransformerBlock(nn.Module):
 
         self.attn1 = Attention(
             query_dim=dim,
-            heads=num_attention_heads,
+            num_heads=num_attention_heads,
             dim_head=attention_head_dim,
             dropout=dropout,
         )
         self.attn2 = Attention(
             query_dim=dim,
-            cross_attention_dim=cross_attention_dim,
-            heads=num_attention_heads,
             dim_head=attention_head_dim,
             dropout=dropout,
+            cross_attention_dim=cross_attention_dim,
         )
 
+        ff_dim = int(feed_forward_mult * dim)
         # make the SwiGLU and GEGLU the only options for activation funtions
         if activation_fn == "geglu":
-            act_fn = GEGLU(dim, inner_dim, bias=True)
+            act_fn = GEGLU(dim, ff_dim, bias=True)
         elif activation_fn == "swiglu":
-            act_fn = SwiGLU(dim, inner_dim, bias=True)
+            act_fn = SwiGLU(dim, ff_dim, bias=True)
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
-        self.feed_forward = nn.Sequential(nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True), act_fn)
+
+        self.feed_forward = nn.Sequential(
+            nn.LayerNorm(dim, eps=norm_eps, elementwise_affine=True),
+            act_fn,
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim, bias=True),
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        timestep: torch.LongTensor,
     ) -> torch.Tensor:
         """
         Example sizes:
@@ -199,11 +171,15 @@ class TransformerBlock(nn.Module):
             encoder_hidden_states (N,77,768)
             timestep: (N,1280)
         """
+        x1 = self.attn1(self.norm1(hidden_states)) + hidden_states
+        x2 = self.attn2(self.norm2(x1), encoder_hidden_states) + x1
+        out = self.feed_forward(x2)
+        return out
 
 
 class Attention(nn.Module):
     r"""
-    cross attention layer.
+    Cross Attention layer.
 
     Parameters:
         query_dim (`int`):
@@ -335,3 +311,62 @@ class ResnetBlock(nn.Module):
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor)
         return out + input_tensor
+
+
+class SwiGLU(nn.Module):
+    """
+    SwiGLU layer from https://arxiv.org/abs/2002.05202
+
+
+    dim: int number of input channels
+    d_ff: int hidden dimension of the feed forward layer
+
+    GELU = x * phi(x),
+        where phi(x) is the cumulative distribution fn. for gaussian dist.
+    SiLU = x * sigmoid(x)
+
+    GLU = sigmoid(W1 * x) * (W2 * x)
+    GEGLU = GELU(W1 * x) * (W2 * x)
+    SwiGLU = SiLU(W1 * x) * (W2 * x)
+
+    The complete FFN versions
+        FFN_GEGLU = (GELU(W1 * x) * (W2 * x)) * W3
+        FFN_SwiGLU = (SiLU(W1 * x) * (W2 * x)) * W3
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        d_ff: int,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.w1_w2 = nn.Linear(dim, 2 * d_ff, bias=bias)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.w1_w2(x)
+        res, gate = res.chunk(2, dim=-1)
+        return res * self.act(gate)
+
+
+class GEGLU(nn.Module):
+    """
+    GEGLU layer from https://arxiv.org/abs/2002.05202
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        d_ff: int,
+        bias: bool = True,
+        approximate: str = "none",  # or tanh
+    ):
+        super().__init__()
+        self.w1_w2 = nn.Linear(dim, 2 * d_ff, bias=bias)
+        self.act = nn.GELU(approximate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.w1_w2(x)
+        res, gate = res.chunk(2, dim=-1)
+        return res * self.act(gate)
