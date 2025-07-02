@@ -30,7 +30,8 @@ dependencies = [
     "triton>=3.3.1",
     "lpips",
     "taming_transformers",
-    "img2dataset"
+    "img2dataset",
+    "sentence_transformers",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,7 @@ notebook = [
   "jupyter",
   "itkwidgets",
   "jupyter_contrib_nbextensions",
+  "ipywidgets",
 ]
 dev = [
   "ipdb",

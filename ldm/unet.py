@@ -104,14 +104,13 @@ class CrossAttnDownBlock(nn.Module):
         cross_attention_dim: int = 1280,
         feed_forward_mult: int = 4,
         activation_fn: str = "geglu",
-        downsample_padding: int = 1,
     ):
         super().__init__()
-        resnets = nn.ModuleList()
-        attentions = nn.ModuleList()
+        self.resnets = nn.ModuleList()
+        self.attentions = nn.ModuleList()
         for i in range(num_layers):
             in_channels = in_channels if i == 0 else out_channels
-            resnets.append(
+            self.resnets.append(
                 ResnetBlock(
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -120,7 +119,7 @@ class CrossAttnDownBlock(nn.Module):
                     dropout=dropout,
                 )
             )
-            attentions.append(
+            self.attentions.append(
                 TransformerBlock(
                     in_channels=out_channels,
                     num_attention_heads=num_attention_heads,
@@ -132,9 +131,7 @@ class CrossAttnDownBlock(nn.Module):
                     activation_fn=activation_fn,
                 )
             )
-        self.downsample = Downsample2D(
-            out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
-        )
+        self.downsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=True)
 
     def forward(
         self,
@@ -142,21 +139,98 @@ class CrossAttnDownBlock(nn.Module):
         temb: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        output_states = []
-
-        blocks = list(zip(self.resnets, self.attentions))
-
-        for i, (resnet, attn) in enumerate(blocks):
+        output_states = ()
+        for resnet, attn in zip(self.resnets, self.attentions):
             hidden_states = resnet(hidden_states, temb)
             hidden_states = attn(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
             )
-            output_states.append(hidden_states)
+            output_states = output_states + (hidden_states,)
 
         hidden_states = self.downsample(hidden_states)
-        output_states.append(hidden_states)
-        return hidden_states, tuple(output_states)
+        output_states = output_states + (hidden_states,)
+        return hidden_states, output_states
+
+
+class DownBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        norm_num_groups: int = 32,
+    ):
+        super().__init__()
+        self.resnets = nn.ModuleList(
+            [
+                ResnetBlock(
+                    in_channels=in_channels if i == 0 else out_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    norm_num_groups=norm_num_groups,
+                    dropout=dropout,
+                )
+                for i in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        output_states = ()
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states, temb)
+            output_states = output_states + (hidden_states,)
+        return hidden_states, output_states
+
+
+class UpBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        prev_output_channel: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        norm_num_groups: int = 32,
+    ):
+        super().__init__()
+        self.resnets = nn.ModuleList()
+        for i in range(num_layers):
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+            self.resnets.append(
+                ResnetBlock(
+                    in_channels=resnet_in_channels + res_skip_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    norm_num_groups=norm_num_groups,
+                    dropout=dropout,
+                )
+            )
+
+        self.upsample = nn.Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        res_hidden_states_tuple: Tuple[torch.Tensor, ...],
+        temb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for i, resnet in enumerate(self.resnets, start=1):
+            hidden_states = torch.cat([hidden_states, res_hidden_states_tuple[-i]], dim=1)
+
+            hidden_states = resnet(hidden_states, temb)
+
+        hidden_states = nn.functional.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
+        hidden_states = self.upsample(hidden_states)
+        return hidden_states
 
 
 class CrossAttnUpBlock(nn.Module):
@@ -176,22 +250,22 @@ class CrossAttnUpBlock(nn.Module):
         activation_fn: str = "geglu",
     ):
         super().__init__()
-        resnets = nn.ModuleList()
-        attentions = nn.ModuleList()
+        self.resnets = nn.ModuleList()
+        self.attentions = nn.ModuleList()
         for i in range(num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
             resnet_in_channels = prev_output_channel if i == 0 else out_channels
 
-            resnets.append(
+            self.resnets.append(
                 ResnetBlock(
-                    in_channels=in_channels,
+                    in_channels=resnet_in_channels + res_skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
                     norm_num_groups=norm_num_groups,
                     dropout=dropout,
                 )
             )
-            attentions.append(
+            self.attentions.append(
                 TransformerBlock(
                     in_channels=out_channels,
                     num_attention_heads=num_attention_heads,
@@ -203,7 +277,7 @@ class CrossAttnUpBlock(nn.Module):
                     activation_fn=activation_fn,
                 )
             )
-        self.upsample = Upsample2D(out_channels, use_conv=True, out_channels=out_channels)
+        self.upsample = nn.Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
 
     def forward(
         self,
@@ -212,17 +286,82 @@ class CrossAttnUpBlock(nn.Module):
         temb: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        for resnet, attn in zip(self.resnets, self.attentions):
-            res_hidden_states = res_hidden_states_tuple[-1]
-            res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+        for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions), start=1):
+            hidden_states = torch.cat([hidden_states, res_hidden_states_tuple[-i]], dim=1)
 
             hidden_states = resnet(hidden_states, temb)
             hidden_states = attn(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
             )
+        hidden_states = nn.functional.interpolate(hidden_states, scale_factor=2.0, mode="nearest")
         hidden_states = self.upsample(hidden_states)
+        return hidden_states
+
+
+class CrossAttnBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        transformer_layers_per_block: int = 1,
+        norm_num_groups: int = 32,
+        num_attention_heads: int = 8,
+        cross_attention_dim: int = 1280,
+        feed_forward_mult: int = 4,
+        activation_fn: str = "geglu",
+        downsample_padding: int = 1,
+    ):
+        super().__init__()
+        self.resnets = nn.ModuleList(
+            [
+                ResnetBlock(
+                    in_channels=in_channels if i == 0 else out_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    norm_num_groups=norm_num_groups,
+                    dropout=dropout,
+                )
+                for i in range(num_layers + 1)
+            ]
+        )
+        self.attentions = nn.ModuleList(
+            [
+                TransformerBlock(
+                    in_channels=out_channels,
+                    num_attention_heads=num_attention_heads,
+                    num_layers=transformer_layers_per_block,
+                    cross_attention_dim=cross_attention_dim,
+                    dropout=dropout,
+                    norm_num_groups=norm_num_groups,
+                    feed_forward_mult=feed_forward_mult,
+                    activation_fn=activation_fn,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.downsample = Downsample2D(
+            out_channels, use_conv=True, out_channels=out_channels, padding=downsample_padding, name="op"
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        hidden_states = self.resnets[0](hidden_states, temb)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+            hidden_states = attn(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+            hidden_states = resnet(hidden_states, temb)
+
         return hidden_states
 
 
