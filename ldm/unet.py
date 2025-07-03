@@ -1,4 +1,4 @@
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Tuple
 from diffusers.models.embeddings import get_timestep_embedding
 import torch
 from torch import nn
@@ -110,11 +110,9 @@ class UNet(nn.Module):
 
         self.up_blocks = nn.ModuleList([get_up_block(i) for i in range(len(block_out_channels))])
         self.final_conv = nn.Sequential(
-            [
-                nn.GroupNorm(num_groups=norm_num_groups, num_channels=block_out_channels[0]),
-                nn.SiLU(),
-                nn.Conv2d(block_out_channels[0], in_channels, kernel_size=3, stride=1, padding=1),
-            ]
+            nn.GroupNorm(num_groups=norm_num_groups, num_channels=block_out_channels[0]),
+            nn.SiLU(),
+            nn.Conv2d(block_out_channels[0], in_channels, kernel_size=3, stride=1, padding=1),
         )
 
     def forward(
@@ -131,7 +129,7 @@ class UNet(nn.Module):
             encoder_hidden_states (`torch.Tensor`):
                 The encoder hidden states with shape `(batch, sequence_length, feature_dim)`.
         """
-        temb = get_timestep_embed(sample, timestep, self.block_out_channels[0])  # (N,320)
+        temb = get_time_embed(sample, timestep, self.block_out_channels[0])  # (N,320)
         temb = self.time_embedding(temb)  # (N, 1280)
 
         hidden_states = self.conv_in(sample)
@@ -300,7 +298,7 @@ class UpBlock(nn.Module):
                     dropout=dropout,
                 )
             )
-        self.upsample = nn.Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
+        self.upsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
 
     def forward(
         self,
@@ -366,7 +364,7 @@ class CrossAttnUpBlock(nn.Module):
             )
         self.upsample = None
         if add_upsample:
-            self.upsample = nn.Conv(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
+            self.upsample = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True)
 
     def forward(
         self,
@@ -478,6 +476,7 @@ class TransformerModel(nn.Module):
     ):
         super().__init__()
         assert in_channels % num_attention_heads == 0, "in_channels must be divisible by num_attention_heads"
+        self.in_channels = in_channels
         self.norm = nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, affine=True)
         self.proj_in = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.transformer_blocks = nn.ModuleList(
@@ -493,7 +492,7 @@ class TransformerModel(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.proj_out = torch.nn.Conv2d(self.inner_dim, self.out_channels, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(
         self,
@@ -631,11 +630,11 @@ class Attention(nn.Module):
 
         self.inner_dim = dim_head * num_heads
 
-        self.q_proj = Linear(query_dim, self.inner_dim, bias=False)
-        self.kv_proj = Linear(self.cross_attention_dim, self.inner_dim * 2, bias=False)
+        self.q_proj = nn.Linear(query_dim, self.inner_dim, bias=False)
+        self.kv_proj = nn.Linear(self.cross_attention_dim, self.inner_dim * 2, bias=False)
 
         self.output_proj = nn.Sequential(
-            Linear(self.inner_dim, self.inner_dim, bias=True),
+            nn.Linear(self.inner_dim, self.inner_dim, bias=True),
             nn.Dropout(dropout),
         )
 
@@ -706,7 +705,7 @@ class ResnetBlock(nn.Module):
             nn.GroupNorm(num_groups=norm_num_groups, num_channels=out_channels),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
         self.conv_shortcut = None
         if in_channels != out_channels:
@@ -789,3 +788,174 @@ class GEGLU(nn.Module):
         res = self.w1_w2(x)
         res, gate = res.chunk(2, dim=-1)
         return res * self.act(gate)
+
+
+if __name__ == "__main__":
+    print("Creating UNet model...")
+    unet = UNet()
+
+    print(f"UNet parameters: {sum(p.numel() for p in unet.parameters()):,}")
+
+    # Create test tensors
+    batch_size = 2
+    height, width = 32, 32  # Assuming 256x256 input divided by 8 (VAE downsampling)
+    in_channels = 4  # Latent space channels
+    seq_len = 77  # CLIP text encoder sequence length
+    text_embed_dim = 768  # CLIP text embedding dimension
+
+    print("Creating test tensors...")
+
+    # Sample tensor (latent representation)
+    sample = torch.randn(batch_size, in_channels, height, width)
+    print(f"Sample shape: {sample.shape}")
+
+    # Timestep (can be tensor, float, or int)
+    timestep = torch.randint(0, 1000, (batch_size,))
+    print(f"Timestep shape: {timestep.shape}")
+
+    # Text encoder hidden states
+    encoder_hidden_states = torch.randn(batch_size, seq_len, text_embed_dim)
+    print(f"Encoder hidden states shape: {encoder_hidden_states.shape}")
+
+    print("\nRunning forward pass...")
+    try:
+        with torch.no_grad():  # Disable gradients for inference
+            output = unet(sample, timestep, encoder_hidden_states)
+        print(f"Success! Output shape: {output.shape}")
+        print(f"Output min: {output.min().item():.4f}, max: {output.max().item():.4f}")
+        print(f"Output mean: {output.mean().item():.4f}, std: {output.std().item():.4f}")
+
+        # Verify output shape matches input
+        assert output.shape == sample.shape, f"Output shape {output.shape} doesn't match input shape {sample.shape}"
+        print("✓ Output shape verification passed!")
+
+    except Exception as e:
+        print(f"Error during forward pass: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    print("\nTesting different timestep formats...")
+
+    # Test with single float timestep
+    try:
+        with torch.no_grad():
+            output = unet(sample, 500.0, encoder_hidden_states)
+        print("✓ Float timestep test passed!")
+    except Exception as e:
+        print(f"Float timestep test failed: {e}")
+
+    # Test with single int timestep
+    try:
+        with torch.no_grad():
+            output = unet(sample, 250, encoder_hidden_states)
+        print("✓ Int timestep test passed!")
+    except Exception as e:
+        print(f"Int timestep test failed: {e}")
+
+    # Test with different batch sizes
+    print("\nTesting different batch sizes...")
+    for bs in [1, 3]:
+        try:
+            test_sample = torch.randn(bs, in_channels, height, width)
+            test_timestep = torch.randint(0, 1000, (bs,))
+            test_encoder = torch.randn(bs, seq_len, text_embed_dim)
+
+            with torch.no_grad():
+                output = unet(test_sample, test_timestep, test_encoder)
+            print(f"✓ Batch size {bs} test passed! Output shape: {output.shape}")
+        except Exception as e:
+            print(f"Batch size {bs} test failed: {e}")
+
+    # Test CUDA if available
+    if torch.cuda.is_available():
+        print(f"\nCUDA is available! Testing on GPU...")
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+        print(f"CUDA device name: {torch.cuda.get_device_name()}")
+
+        # Test different precisions
+        precisions = [
+            (torch.float32, "float32"),
+            (torch.bfloat16, "bfloat16"),
+        ]
+
+        for dtype, dtype_name in precisions:
+            print(f"\nTesting CUDA with {dtype_name} precision...")
+            try:
+                # Move model to CUDA and set precision
+                unet_cuda = unet.to("cuda").to(dtype)
+
+                # Create CUDA tensors with appropriate dtype
+                sample_cuda = torch.randn(batch_size, in_channels, height, width, device="cuda", dtype=dtype)
+                timestep_cuda = torch.randint(0, 1000, (batch_size,), device="cuda")
+                encoder_cuda = torch.randn(batch_size, seq_len, text_embed_dim, device="cuda", dtype=dtype)
+
+                print(f"  Sample tensor: {sample_cuda.shape} {sample_cuda.dtype} on {sample_cuda.device}")
+                print(f"  Timestep tensor: {timestep_cuda.shape} {timestep_cuda.dtype} on {timestep_cuda.device}")
+                print(f"  Encoder tensor: {encoder_cuda.shape} {encoder_cuda.dtype} on {encoder_cuda.device}")
+
+                # Run forward pass
+                with torch.no_grad():
+                    output_cuda = unet_cuda(sample_cuda, timestep_cuda, encoder_cuda)
+
+                print(f"  ✓ CUDA {dtype_name} test passed! Output shape: {output_cuda.shape}")
+                print(f"  Output dtype: {output_cuda.dtype}, device: {output_cuda.device}")
+                print(f"  Output stats - min: {output_cuda.min().item():.4f}, max: {output_cuda.max().item():.4f}")
+                print(f"  Output stats - mean: {output_cuda.mean().item():.4f}, std: {output_cuda.std().item():.4f}")
+
+                # Test memory usage
+                allocated_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+                cached_memory = torch.cuda.memory_reserved() / 1024**3  # GB
+                print(f"  GPU Memory - Allocated: {allocated_memory:.2f} GB, Cached: {cached_memory:.2f} GB")
+
+                # Verify output shape
+                assert output_cuda.shape == sample_cuda.shape, (
+                    f"CUDA output shape mismatch: {output_cuda.shape} vs {sample_cuda.shape}"
+                )
+                print(f"  ✓ CUDA {dtype_name} shape verification passed!")
+
+                # Test different batch sizes on CUDA
+                print(f"  Testing different batch sizes on CUDA {dtype_name}...")
+                for bs in [1, 4]:
+                    try:
+                        test_sample_cuda = torch.randn(bs, in_channels, height, width, device="cuda", dtype=dtype)
+                        test_timestep_cuda = torch.randint(0, 1000, (bs,), device="cuda")
+                        test_encoder_cuda = torch.randn(bs, seq_len, text_embed_dim, device="cuda", dtype=dtype)
+
+                        with torch.no_grad():
+                            test_output_cuda = unet_cuda(test_sample_cuda, test_timestep_cuda, test_encoder_cuda)
+                        print(f"    ✓ CUDA {dtype_name} batch size {bs} test passed! Shape: {test_output_cuda.shape}")
+                    except Exception as e:
+                        print(f"    CUDA {dtype_name} batch size {bs} test failed: {e}")
+
+                # Clear GPU memory
+                del sample_cuda, timestep_cuda, encoder_cuda, output_cuda
+                if "test_sample_cuda" in locals():
+                    del test_sample_cuda, test_timestep_cuda, test_encoder_cuda, test_output_cuda
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"  CUDA {dtype_name} test failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+                # Clear GPU memory on failure
+                torch.cuda.empty_cache()
+
+        # Move model back to CPU
+        try:
+            unet = unet.to("cpu").to(torch.float32)
+            print(f"\n✓ Model moved back to CPU successfully")
+        except Exception as e:
+            print(f"Warning: Failed to move model back to CPU: {e}")
+
+    else:
+        print(f"\nCUDA is not available. Skipping GPU tests.")
+        print("To enable CUDA testing, ensure you have:")
+        print("  1. A CUDA-compatible GPU")
+        print("  2. CUDA drivers installed")
+        print("  3. PyTorch compiled with CUDA support")
+
+    print("\nAll tests completed!")
