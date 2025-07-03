@@ -90,3 +90,21 @@ The `prepare_webdataset.py` script performs:
 - Packaging resized images into POSIX-compliant tar archives.
 - Maintaining structured file naming conventions for streamlined WebDataset usage.
 
+## Dataset Filtering
+As described in the experimental write-up, I trained a latent diffusion model on the LAION-POP plus a subset of the LAION Aesthetic dataset (as described above).
+The model was capable of generating high quality images of outdoor nature scenes, indoor furniture, and food.
+Sometimes the model would generate reasonable quality headshot portrait photos or artistic portrait drawings, but often it would struggle to generate well proportioned, realistic, and detailed human faces.
+Given my limited compute and training budget, I decided to experiment with training the LDM on a dataset of reduced scope to see if the model could learn to generate realistic images of human faces, or outdoor nature scenes in fewer iterations.
+
+The LAION-POP + LAION Aesthetic dataset I had been working with was 752,647 samples in size. I filtered the image-caption paired dataset by applying a [pre-trained Sentence Transformer model](https://huggingface.co/sentence-transformers/paraphrase-MiniLM-L6-v2)
+to embed the image captions into a vector space in order to compute the cosine similarity between the image caption embedding and the filtered topic of interest.
+For example, I applied the topic filter of "an outdoor scene in nature, like a beach, forest, mountain, river, or grassy field" to filter the 750k image-caption dataset down to a 28,185 image subset (given a 0.40 cosine similarity score filter threshold).
+
+| Filter Topic                                                                 | Number Images Passing | Pass Rate | Cosine Similarity Threshold |
+|------------------------------------------------------------------------------|-----------|-----------|------------------------|
+| an outdoor scene in nature, like a beach, forest, mountain, river, or grassy field | 28,185    | 3.74%     | 0.40                   |
+| a photo of a dog                                                             | 9,437     | 1.25%     | 0.40                   |
+| a photo of a woman                                                           | 101,853   | 13.53%    | 0.40                   |
+| a photo of a man                                                             | 39,620    | 5.26%     | 0.40                   |
+
+The [filter_dataset.py](ldm/tools/filter_dataset.py) can be run to compute these metrics.
