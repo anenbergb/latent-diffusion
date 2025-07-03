@@ -2,23 +2,8 @@ from typing import List, Union, Optional
 from diffusers.models.embeddings import get_timestep_embedding
 import torch
 from torch import nn
-from dataclasses import dataclass, field
 from jaxtyping import Float
 from einops import einsum, rearrange
-
-
-@dataclass
-class UNetConfig:
-    attention_head_dim: int = field(default=8)
-    # The tuple of output channels for each block
-    block_out_channels: List[int] = field(default_factory=lambda: [320, 640, 1280, 1280])
-    cross_attention_dim: int = field(default=768)
-    in_channels: int = field(default=4)
-    layers_per_block: int = field(default=2)
-    norm_num_groups: float = field(default=32)
-    out_channels: int = field(default=4)
-    # Height and width of input/output sample.
-    sample_size: int = field(default=32)
 
 
 class UNet(nn.Module):
@@ -31,12 +16,9 @@ class UNet(nn.Module):
         layers_per_block: int = 2,
         transformer_layers_per_block: int = 1,
         norm_num_groups: float = 32,
-        out_channels: int = 4,
         dropout: float = 0.0,
         feed_forward_mult: int = 4,
         activation_fn: str = "geglu",
-        # Height and width of input/output sample.
-        sample_size: int = 32,
     ):
         super().__init__()
         assert len(block_out_channels) > 1
@@ -51,7 +33,7 @@ class UNet(nn.Module):
         )
 
         def get_down_block(i):
-            in_chan = block_out_channels[0] if i == 0 else block_out_channels[i-1]
+            in_chan = block_out_channels[0] if i == 0 else block_out_channels[i - 1]
             # last block is simple ResNet DownBlock
             if i == len(block_out_channels) - 1:
                 return DownBlock(
@@ -76,43 +58,45 @@ class UNet(nn.Module):
                     feed_forward_mult=feed_forward_mult,
                     activation_fn=activation_fn,
                 )
-     
+
         self.down_blocks = nn.ModuleList([get_down_block(i) for i in range(len(block_out_channels))])
         self.mid_block = CrossAttnBlock(
             in_channels=block_out_channels[-1],
             out_channels=block_out_channels[-1],
             temb_channels=temb_channels,
-            dropout = dropout,
-            num_layers = 1,
-            transformer_layers_per_block = transformer_layers_per_block,
-            norm_num_groups = norm_num_groups,
-            num_attention_heads = num_attention_heads,
-            cross_attention_dim = cross_attention_dim,
-            feed_forward_mult = feed_forward_mult,
-            activation_fn = activation_fn,
+            dropout=dropout,
+            num_layers=1,
+            transformer_layers_per_block=transformer_layers_per_block,
+            norm_num_groups=norm_num_groups,
+            num_attention_heads=num_attention_heads,
+            cross_attention_dim=cross_attention_dim,
+            feed_forward_mult=feed_forward_mult,
+            activation_fn=activation_fn,
         )
 
         def get_up_block(i):
             rev_idx = len(block_out_channels) - 1 - i
             in_chan = block_out_channels[-1] if i == 0 else block_out_channels[rev_idx + 1]
+            final_skip_channels = block_out_channels[0] if rev_idx == 0 else block_out_channels[rev_idx - 1]
+
             # all blocks upsample except the final up block
             add_upsample = i < len(block_out_channels) - 1
             if i == 0:
                 return UpBlock(
-                    in_channels=in_channels,
+                    in_channels=in_chan,
                     out_channels=block_out_channels[rev_idx],
-                    prev_output_channel=,
-                    temb_channels=,
+                    final_skip_channels=final_skip_channels,
+                    temb_channels=temb_channels,
                     dropout=dropout,
                     num_layers=layers_per_block + 1,
                     norm_num_groups=norm_num_groups,
                 )
             else:
                 return CrossAttnUpBlock(
-                    in_channels=in_channels,
+                    in_channels=in_chan,
                     out_channels=block_out_channels[rev_idx],
-                    prev_output_channel=,
-                    temb_channels=,
+                    final_skip_channels=final_skip_channels,
+                    temb_channels=temb_channels,
                     dropout=dropout,
                     num_layers=layers_per_block + 1,
                     transformer_layers_per_block=transformer_layers_per_block,
@@ -123,14 +107,15 @@ class UNet(nn.Module):
                     activation_fn=activation_fn,
                     add_upsample=add_upsample,
                 )
-        
-        self.up_blocks = nn.ModuleList([get_up_block(i) for i in range(len(block_out_channels))])
-        self.final_conv = nn.Sequential([
-            nn.GroupNorm(num_groups=norm_num_groups, num_channels=block_out_channels[0]),
-            nn.SiLU(),
-            nn.Conv2d(block_out_channels[0], in_channels, kernel_size=3, stride=1, padding=1)
-        ])
 
+        self.up_blocks = nn.ModuleList([get_up_block(i) for i in range(len(block_out_channels))])
+        self.final_conv = nn.Sequential(
+            [
+                nn.GroupNorm(num_groups=norm_num_groups, num_channels=block_out_channels[0]),
+                nn.SiLU(),
+                nn.Conv2d(block_out_channels[0], in_channels, kernel_size=3, stride=1, padding=1),
+            ]
+        )
 
     def forward(
         self,
@@ -153,13 +138,9 @@ class UNet(nn.Module):
         down_block_res_states = (hidden_states,)
         for downsample_block in self.down_blocks:
             if isinstance(downsample_block, CrossAttnDownBlock):
-                hidden_states, res_states = downsample_block(
-                    hidden_states, temb, encoder_hidden_states
-                )
-            else: # DownBlock
-                hidden_states, res_states = downsample_block(
-                    hidden_states, temb
-                )
+                hidden_states, res_states = downsample_block(hidden_states, temb, encoder_hidden_states)
+            else:  # DownBlock
+                hidden_states, res_states = downsample_block(hidden_states, temb)
             down_block_res_states += res_states
 
         hidden_states = self.mid_block(hidden_states, temb, encoder_hidden_states)
@@ -170,13 +151,11 @@ class UNet(nn.Module):
 
             if isinstance(upsample_block, CrossAttnUpBlock):
                 hidden_states = upsample_block(hidden_states, res_states, temb, encoder_hidden_states)
-            else: # UpBlock
+            else:  # UpBlock
                 hidden_states = upsample_block(hidden_states, res_states, temb)
-        
+
         output = self.final_conv(hidden_states)
         return output
-
-            
 
 
 def get_time_embed(sample: torch.Tensor, timestep: Union[torch.Tensor, float, int], num_channels: int) -> torch.Tensor:
@@ -301,7 +280,7 @@ class UpBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        skip_channels: int,
+        final_skip_channels: int,
         temb_channels: int,
         dropout: float = 0.0,
         num_layers: int = 1,
@@ -310,11 +289,11 @@ class UpBlock(nn.Module):
         super().__init__()
         self.resnets = nn.ModuleList()
         for i in range(num_layers):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            res_in_channels = prev_output_channel if i == 0 else out_channels
+            in_chan = in_channels if i == 0 else out_channels
+            skip_channels = final_skip_channels if i == num_layers - 1 else out_channels
             self.resnets.append(
                 ResnetBlock(
-                    in_channels=res_in_channels + res_skip_channels,
+                    in_channels=in_chan + skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
                     norm_num_groups=norm_num_groups,
@@ -346,7 +325,7 @@ class CrossAttnUpBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        prev_output_channel: int,
+        final_skip_channels: int,
         temb_channels: int,
         dropout: float = 0.0,
         num_layers: int = 1,
@@ -362,12 +341,11 @@ class CrossAttnUpBlock(nn.Module):
         self.resnets = nn.ModuleList()
         self.attentions = nn.ModuleList()
         for i in range(num_layers):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
-
+            in_chan = in_channels if i == 0 else out_channels
+            skip_channels = final_skip_channels if i == num_layers - 1 else out_channels
             self.resnets.append(
                 ResnetBlock(
-                    in_channels=resnet_in_channels + res_skip_channels,
+                    in_channels=in_chan + skip_channels,
                     out_channels=out_channels,
                     temb_channels=temb_channels,
                     norm_num_groups=norm_num_groups,
