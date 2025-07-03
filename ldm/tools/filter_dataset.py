@@ -1,4 +1,5 @@
 import argparse
+import io
 import logging
 import os
 from typing import Optional, List
@@ -7,6 +8,7 @@ import webdataset as wds
 from braceexpand import braceexpand
 import sentence_transformers
 from sentence_transformers import SentenceTransformer
+import PIL.Image
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -30,7 +32,7 @@ def parse_args():
         "--caption_filters",
         type=str,
         nargs="+",
-        default=None,
+        required=True,
         help="List of text phrases to use as filters for dataset captions. "
         "Samples with captions similar to any of these phrases (above the threshold) will be kept. "
         "The filters are combined using logical OR - a sample passes if it matches ANY filter. "
@@ -40,11 +42,15 @@ def parse_args():
         "--caption_filter_thresholds",
         type=float,
         nargs="+",
-        default=None,
+        default=[
+            0.3,
+        ],
         help="Cosine similarity thresholds (0.0-1.0) for each caption filter. "
-        "Must provide one threshold per filter, or none to use default 0.5 for all. "
+        "Must provide one threshold per filter, or a single threshold to apply to all filters, "
+        "or none to use default 0.5 for all. "
         "Higher values = stricter filtering (more similar to filter text required). "
-        "Typical values: 0.3-0.7. Example: --caption_filter_thresholds 0.4 0.6 0.5",
+        "Typical values: 0.3-0.7. Examples: --caption_filter_thresholds 0.4 0.6 0.5 (individual) "
+        "or --caption_filter_thresholds 0.5 (same for all)",
     )
     parser.add_argument(
         "--sentence_transformer_model_name",
@@ -55,16 +61,42 @@ def parse_args():
         "'all-MiniLM-L6-v2' (balanced), 'all-mpnet-base-v2' (best quality, slower). "
         "See https://huggingface.co/sentence-transformers for more models.",
     )
+    parser.add_argument(
+        "--save_sample_images",
+        type=int,
+        default=0,
+        help="Save the first N images that pass the filter criteria as .jpg files. "
+        "Set to 0 to disable image saving (default). Useful for visualizing filter results. "
+        "Example: --save_sample_images 25",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./filtered_samples",
+        help="Directory to save sample images that pass the filter criteria. "
+        "Will be created if it doesn't exist. Only used when --save_sample_images > 0. "
+        "Default: './filtered_samples'",
+    )
 
     args = parser.parse_args()
 
     # Validate arguments
-    if args.caption_filters and args.caption_filter_thresholds:
-        if len(args.caption_filters) != len(args.caption_filter_thresholds):
-            parser.error(
-                f"Number of caption filters ({len(args.caption_filters)}) must match "
-                f"number of thresholds ({len(args.caption_filter_thresholds)})"
-            )
+    if len(args.caption_filter_thresholds) == 1:
+        # Single threshold provided - apply to all filters
+        logging.info(
+            f"Applying single threshold {args.caption_filter_thresholds[0]} to all {len(args.caption_filters)} filters"
+        )
+        args.caption_filter_thresholds = args.caption_filter_thresholds * len(args.caption_filters)
+    elif len(args.caption_filters) != len(args.caption_filter_thresholds):
+        parser.error(
+            f"Number of caption filters ({len(args.caption_filters)}) must match "
+            f"number of thresholds ({len(args.caption_filter_thresholds)}), "
+            f"or provide exactly one threshold to apply to all filters"
+        )
+
+    # Validate save_sample_images argument
+    if args.save_sample_images < 0:
+        parser.error("--save_sample_images must be >= 0")
 
     return args
 
@@ -133,6 +165,35 @@ class CaptionFilter:
         return False
 
 
+def save_image_sample(image_data: bytes, output_dir: str, sample_index: int) -> str:
+    """
+    Save a decoded image sample to the output directory.
+
+    Args:
+        image_data: Raw image bytes from WebDataset
+        output_dir: Directory to save the image
+        sample_index: Index for naming the file
+
+    Returns:
+        Path to the saved image file
+    """
+    try:
+        # Decode image from bytes
+        with io.BytesIO(image_data) as stream:
+            img = PIL.Image.open(stream)
+            img = img.convert("RGB")
+
+        filename = f"sample_{sample_index:04d}.jpg"
+        filepath = os.path.join(output_dir, filename)
+        # Save image
+        img.save(filepath, "JPEG", quality=85)
+        return filepath
+
+    except Exception as e:
+        logging.error(f"Failed to save image sample {sample_index}: {e}")
+        return None
+
+
 def main():
     """Main function to filter and count dataset samples."""
     args = parse_args()
@@ -162,16 +223,17 @@ def main():
     ).to_tuple("jpg", "json")
 
     # Initialize caption filter
-    if args.caption_filters:
-        caption_filter = CaptionFilter(
-            args.caption_filters,
-            args.caption_filter_thresholds,
-            model_name=args.sentence_transformer_model_name,
-        )
-        logging.info("Caption filter initialized")
-    else:
-        caption_filter = None
-        logging.info("No caption filters specified - counting all samples")
+    caption_filter = CaptionFilter(
+        args.caption_filters,
+        args.caption_filter_thresholds,
+        model_name=args.sentence_transformer_model_name,
+    )
+    logging.info("Caption filter initialized")
+
+    # Setup output directory for sample images if needed
+    if args.save_sample_images > 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logging.info(f"Will save first {args.save_sample_images} filtered images to: {args.output_dir}")
 
     # Process dataset
     logging.info("Processing dataset samples...")
@@ -179,29 +241,22 @@ def main():
     total_count = 0
     filtered_count = 0
 
-    try:
-        for image_data, json_data in dataset_iter:
-            total_count += 1
+    for image_data, json_data in dataset_iter:
+        total_count += 1
 
-            if caption_filter is None:
-                # No filtering - count all samples
-                filtered_count += 1
-            else:
-                # Apply caption filter
-                caption = json_data.get("caption", "")
-                if caption and caption_filter(caption):
-                    filtered_count += 1
+        # Apply caption filter
+        caption = json_data.get("caption", "")
+        if caption and caption_filter(caption):
+            filtered_count += 1
 
-            # Log progress every 1000 samples
-            if total_count % 1000 == 0:
-                pass_rate = (filtered_count / total_count) * 100 if total_count > 0 else 0
-                logging.info(f"Processed {total_count:,} samples, {filtered_count:,} passed filters ({pass_rate:.1f}%)")
+            if args.save_sample_images > 0 and filtered_count <= args.save_sample_images:
+                save_image_sample(image_data, args.output_dir, filtered_count)
 
-    except KeyboardInterrupt:
-        logging.warning("Processing interrupted by user")
-    except Exception as e:
-        logging.error(f"Error processing dataset: {e}")
-        raise
+        # Log progress every 1000 samples
+        if total_count % 1000 == 0:
+            pass_rate = (filtered_count / total_count) * 100 if total_count > 0 else 0
+            progress_msg = f"Processed {total_count:,} samples, {filtered_count:,} passed filters ({pass_rate:.1f}%)"
+            logging.info(progress_msg)
 
     # Final statistics
     pass_rate = (filtered_count / total_count) * 100 if total_count > 0 else 0
@@ -214,11 +269,10 @@ def main():
     logging.info(f"Pass rate:                   {pass_rate:.2f}%")
     logging.info(f"Samples filtered out:        {total_count - filtered_count:,}")
 
-    if caption_filter:
-        logging.info(f"Filter texts used:           {len(args.caption_filters)}")
-        for i, text in enumerate(args.caption_filters):
-            threshold = args.caption_filter_thresholds[i] if args.caption_filter_thresholds else 0.5
-            logging.info(f"  Filter {i + 1}: '{text}' (threshold: {threshold:.3f})")
+    logging.info(f"Filter texts used:           {len(args.caption_filters)}")
+    for i, text in enumerate(args.caption_filters):
+        threshold = args.caption_filter_thresholds[i] if args.caption_filter_thresholds else 0.5
+        logging.info(f"  Filter {i + 1}: '{text}' (threshold: {threshold:.3f})")
 
     logging.info("=" * 60)
 
