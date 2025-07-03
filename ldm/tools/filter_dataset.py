@@ -77,6 +77,15 @@ def parse_args():
         "Will be created if it doesn't exist. Only used when --save_sample_images > 0. "
         "Default: './filtered_samples'",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to run the SentenceTransformer model on. "
+        "Choose 'cuda' for GPU acceleration (requires CUDA-compatible GPU) or 'cpu' for CPU execution. "
+        "Default: 'cpu'",
+    )
 
     args = parser.parse_args()
 
@@ -138,7 +147,7 @@ class CaptionFilter:
             )
 
         logging.info(f"Computing embeddings for {len(filter_texts)} filter texts...")
-        self.filter_embeddings = [self.model.encode(text, convert_to_tensor=True) for text in filter_texts]
+        self.filter_embeddings = [self.model.encode(text, convert_to_tensor=True, show_progress_bar=False) for text in filter_texts]
 
         # Log filter configuration
         for i, (text, threshold) in enumerate(zip(filter_texts, self.thresholds)):
@@ -154,7 +163,7 @@ class CaptionFilter:
         Returns:
             True if caption passes any filter, False otherwise
         """
-        caption_embedding = self.model.encode(caption, convert_to_tensor=True)
+        caption_embedding = self.model.encode(caption, convert_to_tensor=True, show_progress_bar=False)
 
         for i, (filter_embedding, threshold) in enumerate(zip(self.filter_embeddings, self.thresholds)):
             score = sentence_transformers.util.cos_sim(filter_embedding, caption_embedding).item()
@@ -206,7 +215,6 @@ def main():
     for spec in args.dataset_tar_specs:
         expanded = braceexpand(spec)
         tar_files.extend(expanded)
-        logging.info(f"Spec '{spec}' expanded to {len(expanded)} files")
 
     if not tar_files:
         raise FileNotFoundError("No tar files resolved from --dataset_tar_specs")
@@ -220,13 +228,14 @@ def main():
         repeat=False,
         shardshuffle=False,
         detshuffle=False,
-    ).to_tuple("jpg", "json")
+    ).decode().to_tuple("jpg", "json")
 
     # Initialize caption filter
     caption_filter = CaptionFilter(
         args.caption_filters,
         args.caption_filter_thresholds,
         model_name=args.sentence_transformer_model_name,
+        device=args.device
     )
     logging.info("Caption filter initialized")
 
