@@ -500,7 +500,8 @@ def generate(
     seed: int | None = None,
     device: torch.device = torch.device("cuda"),
     weight_dtype: torch.dtype = torch.bfloat16,
-    return_type: str = "pil",  #
+    return_type: str = "pil",
+    is_hf_diffusion_model: bool = False,
 ) -> Image.Image:
     # Prompt -> embeddings (classifier-free guidance = cond + uncond)
     text_inputs = tokenizer(
@@ -536,7 +537,11 @@ def generate(
         latent_in = torch.cat([latents] * 2, dim=0)  # (2,4,32,32)
         latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
 
-        noise_pred = diffusion_model(latent_in, timestep, embeds, return_dict=False)[0]
+        if is_hf_diffusion_model:
+            noise_pred = diffusion_model(latent_in, timestep, embeds, return_dict=False)[0]
+        else:
+            noise_pred = diffusion_model(latent_in, timestep, embeds)
+
         eps_uncond, eps_cond = noise_pred.chunk(2)
 
         # Classifier-free guidance
@@ -565,6 +570,7 @@ def log_validation(
     args,
     accelerator,
     train_step,
+    is_hf_diffusion_model: bool = False,
 ):
     accelerator.print(f"Running validation at step {train_step}...")
     diffusion_model.eval()
@@ -586,6 +592,7 @@ def log_validation(
                     seed=args.seed + i if args.seed is not None else None,
                     device=accelerator.device,
                     return_type="torch",
+                    is_hf_diffusion_model=is_hf_diffusion_model,
                 )
                 images.append(image)
 
@@ -674,9 +681,6 @@ def train_ldm(args):
             diffusion_model = UNet(in_channels=vae.config.latent_channels)
         else:
             raise ValueError(f"Unknown diffusion model: {args.diffusion_model}")
-    import ipdb
-
-    ipdb.set_trace()
     diffusion_model.to(memory_format=torch.channels_last)
 
     if args.hf_scheduler_repo_id:
@@ -939,7 +943,17 @@ def train_ldm(args):
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_diffusion_model.store(diffusion_model.parameters())
                     ema_diffusion_model.copy_to(diffusion_model.parameters())
-                log_validation(tokenizer, text_encoder, vae, diffusion_model, noise_scheduler, args, accelerator, step)
+                log_validation(
+                    tokenizer,
+                    text_encoder,
+                    vae,
+                    diffusion_model,
+                    noise_scheduler,
+                    args,
+                    accelerator,
+                    step,
+                    is_hf_diffusion_model=is_hf_diffusion_model,
+                )
                 if args.use_ema:
                     # Switch back to the original UNet parameters
                     ema_diffusion_model.restore(diffusion_model.parameters())

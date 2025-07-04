@@ -159,14 +159,14 @@ accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusio
 --hf_scheduler_subfolder "scheduler" \
 --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
 --enable_torch_compile --use_8bit_adam \
---train_batch_size 250 \
+--train_batch_size 50 \
 --gradient_accumulation_steps 5 \
 --lr_warmup_steps 10000 \
 --max_train_steps 100000 \
 --lr_constant_steps 60000 \
 --lr_scheduler cosine_with_warmup_then_constant \
 --checkpointing_steps 1000 \
---milestone_checkpoints 10000 50000 60000 \
+--milestone_checkpoints 10000 50000 70000 \
 --mixed_precision bf16 \
 --dataloader_num_workers 2 \
 --noise_offset 0.1 \
@@ -174,5 +174,5 @@ accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusio
 --validation_prompts "${VALIDATION_PROMPTS[@]}" \
 --generations_per_val_prompt 3 \
 --text_conditioning_dropout 0.1 \
---seed 42
-# --resume_from_checkpoint latest
+--seed 42 \
+--resume_from_checkpoint latest
