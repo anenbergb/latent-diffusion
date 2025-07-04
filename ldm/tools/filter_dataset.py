@@ -9,6 +9,7 @@ from braceexpand import braceexpand
 import sentence_transformers
 from sentence_transformers import SentenceTransformer
 import PIL.Image
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -116,8 +117,6 @@ class CaptionFilter:
 
     Uses cosine similarity between embeddings to determine if a caption should be kept.
     Supports multiple filter texts with individual thresholds (OR logic).
-
-    Default model 'paraphrase-MiniLM-L6-v2' provides fast, ~384-dimensional embeddings.
     """
 
     def __init__(
@@ -128,41 +127,39 @@ class CaptionFilter:
         device: str = "cpu",
     ):
         """
-        Initialize the caption filter.
-
-        Args:
-            filter_texts: List of reference texts to filter against
-            filter_thresholds: Cosine similarity thresholds for each filter text
-            model_name: SentenceTransformer model name
-            device: Device to run the model on ('cpu' or 'cuda')
+        Setup filter config but defer actual model initialization until first use.
         """
-        logging.info(f"Loading SentenceTransformer model: {model_name}")
-        self.model = SentenceTransformer(model_name, device=device)
         self.filter_texts = filter_texts
         self.thresholds = filter_thresholds or [0.5] * len(filter_texts)
+        self.model_name = model_name
+        self.device = device
 
         if len(self.thresholds) != len(filter_texts):
             raise ValueError(
                 f"Number of thresholds ({len(self.thresholds)}) must match number of filter texts ({len(filter_texts)})"
             )
 
-        logging.info(f"Computing embeddings for {len(filter_texts)} filter texts...")
-        self.filter_embeddings = [self.model.encode(text, convert_to_tensor=True, show_progress_bar=False) for text in filter_texts]
+        self.model = None
+        self.filter_embeddings = None
 
-        # Log filter configuration
-        for i, (text, threshold) in enumerate(zip(filter_texts, self.thresholds)):
-            logging.info(f"Filter {i + 1}: '{text}' (threshold: {threshold:.3f})")
+    def _lazy_init(self):
+        if self.model is not None:
+            return  # already initialized
+
+        logging.info(f"[PID {os.getpid()}] Loading SentenceTransformer model: {self.model_name}")
+        self.model = SentenceTransformer(self.model_name, device=self.device)
+
+        logging.info(f"[PID {os.getpid()}] Computing embeddings for {len(self.filter_texts)} filter texts...")
+        self.filter_embeddings = [
+            self.model.encode(text, convert_to_tensor=True, show_progress_bar=False) for text in self.filter_texts
+        ]
+
+        for i, (text, threshold) in enumerate(zip(self.filter_texts, self.thresholds)):
+            logging.info(f"[PID {os.getpid()}] Filter {i + 1}: '{text}' (threshold: {threshold:.3f})")
 
     def __call__(self, caption: str) -> bool:
-        """
-        Check if a caption passes any of the filters.
+        self._lazy_init()
 
-        Args:
-            caption: Caption text to check
-
-        Returns:
-            True if caption passes any filter, False otherwise
-        """
         caption_embedding = self.model.encode(caption, convert_to_tensor=True, show_progress_bar=False)
 
         for i, (filter_embedding, threshold) in enumerate(zip(self.filter_embeddings, self.thresholds)):
@@ -172,6 +169,26 @@ class CaptionFilter:
                 return True
 
         return False
+
+    def filter_batch(self, captions: List[str]) -> List[bool]:
+        self._lazy_init()
+
+        start = time.time()
+        caption_embeddings = self.model.encode(captions, convert_to_tensor=True, show_progress_bar=False)
+        duration = time.time() - start
+
+        passed = []
+        for idx, caption_embedding in enumerate(caption_embeddings):
+            match = False
+            for filter_embedding, threshold in zip(self.filter_embeddings, self.thresholds):
+                score = sentence_transformers.util.cos_sim(filter_embedding, caption_embedding).item()
+                if score >= threshold:
+                    match = True
+                    break
+            passed.append(match)
+
+        logging.info(f"[{sum(passed)}/{len(captions)}] passed filter. Encoding took {duration:.4f} seconds")
+        return passed
 
 
 def save_image_sample(image_data: bytes, output_dir: str, sample_index: int) -> str:
@@ -223,19 +240,23 @@ def main():
 
     # Create WebDataset
     logging.info("Creating WebDataset...")
-    dataset = wds.WebDataset(
-        tar_files,
-        repeat=False,
-        shardshuffle=False,
-        detshuffle=False,
-    ).decode().to_tuple("jpg", "json")
+    dataset = (
+        wds.WebDataset(
+            tar_files,
+            repeat=False,
+            shardshuffle=False,
+            detshuffle=False,
+        )
+        .decode()
+        .to_tuple("jpg", "json")
+    )
 
     # Initialize caption filter
     caption_filter = CaptionFilter(
         args.caption_filters,
         args.caption_filter_thresholds,
         model_name=args.sentence_transformer_model_name,
-        device=args.device
+        device=args.device,
     )
     logging.info("Caption filter initialized")
 

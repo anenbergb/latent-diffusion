@@ -26,10 +26,11 @@ from diffusers import (
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
-from diffusers.utils import make_image_grid
 from diffusers.configuration_utils import ConfigMixin
 from transformers import CLIPTextModel, CLIPTokenizer
 from huggingface_hub import hf_hub_download
+
+from ldm.tools.filter_dataset import CaptionFilter
 
 
 def parse_args():
@@ -107,6 +108,56 @@ def parse_args():
         type=int,
         default=10000,
         help="Number of samples in WebDataset shuffle buffer.",
+    )
+    parser.add_argument(
+        "--caption_filters",
+        type=str,
+        nargs="+",
+        required=False,
+        default=None,
+        help="List of text phrases to use as filters for dataset captions. "
+        "Samples with captions similar to any of these phrases (above the threshold) will be kept. "
+        "The filters are combined using logical OR - a sample passes if it matches ANY filter. "
+        "Example: --caption_filters 'a cat' 'dog playing' 'beautiful landscape'",
+    )
+    parser.add_argument(
+        "--caption_filter_thresholds",
+        type=float,
+        nargs="+",
+        default=[
+            0.4,
+        ],
+        help="Cosine similarity thresholds (0.0-1.0) for each caption filter. "
+        "Must provide one threshold per filter, or a single threshold to apply to all filters, "
+        "or none to use default 0.5 for all. "
+        "Higher values = stricter filtering (more similar to filter text required). "
+        "Typical values: 0.3-0.7. Examples: --caption_filter_thresholds 0.4 0.6 0.5 (individual) "
+        "or --caption_filter_thresholds 0.5 (same for all)",
+    )
+    parser.add_argument(
+        "--sentence_transformer_model_name",
+        type=str,
+        default="paraphrase-MiniLM-L6-v2",
+        help="HuggingFace SentenceTransformer model name for computing text embeddings. "
+        "Popular options: 'paraphrase-MiniLM-L6-v2' (fast, 384-dim), "
+        "'all-MiniLM-L6-v2' (balanced), 'all-mpnet-base-v2' (best quality, slower). "
+        "See https://huggingface.co/sentence-transformers for more models.",
+    )
+    parser.add_argument(
+        "--sentence_transformer_batch_size",
+        type=int,
+        default=1000,
+        help="Number of captionst to process in a single batch",
+    )
+
+    parser.add_argument(
+        "--sentence_transformer_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+        help="Device to run the SentenceTransformer model on. "
+        "Choose 'cuda' for GPU acceleration (requires CUDA-compatible GPU) or 'cpu' for CPU execution. "
+        "Default: 'cpu'",
     )
 
     # --- image & caption preprocessing ------------------------------------- #
@@ -230,11 +281,32 @@ def parse_args():
         help="Classifier-free guidance scale for inference (7.5 is a good default).",
     )
     parser.add_argument("--mixed_precision", choices=["fp32", "fp16", "bf16"], default="bf16", help="AMP dtype.")
-    parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Worker processes for DataLoader.")
+    parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=4,
+        help="Worker processes for DataLoader. "
+        "This should be less than or equal to the number of .tar files that WebDataset is loading from.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--output_dir", type=str, default="sd-model-finetuned", help="Checkpoint / TB dir.")
 
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.caption_filters:
+        if len(args.caption_filter_thresholds) == 1:
+            # Single threshold provided - apply to all filters
+            logging.info(
+                f"Applying single threshold {args.caption_filter_thresholds[0]} to all {len(args.caption_filters)} filters"
+            )
+            args.caption_filter_thresholds = args.caption_filter_thresholds * len(args.caption_filters)
+        elif len(args.caption_filters) != len(args.caption_filter_thresholds):
+            parser.error(
+                f"Number of caption filters ({len(args.caption_filters)}) must match "
+                f"number of thresholds ({len(args.caption_filter_thresholds)}), "
+                f"or provide exactly one threshold to apply to all filters"
+            )
     return args
 
 
@@ -295,20 +367,35 @@ def build_webdataset(args, tokenizer):
     if not tar_files:
         raise FileNotFoundError("No tar files resolved from --dataset_tar_specs")
 
+    logging.info(f"Found {len(tar_files)} tar files to load for training.")
+
     # WebDataset decode logic
     # https://github.com/webdataset/webdataset/blob/main/webdataset/autodecode.py#L299
-    dataset = (
-        wds.WebDataset(
-            tar_files,
-            repeat=False,
-            shardshuffle=len(tar_files),
-            detshuffle=True,
-            seed=args.seed,
+    dataset = wds.WebDataset(
+        tar_files,
+        repeat=False,
+        shardshuffle=len(tar_files),
+        detshuffle=True,
+        seed=args.seed,
+    ).shuffle(args.shuffle_buffer)
+
+    if args.caption_filters:
+        caption_filter = CaptionFilter(
+            filter_texts=args.caption_filters,
+            filter_thresholds=args.caption_filter_thresholds,
+            model_name=args.sentence_transformer_model_name,
+            device=args.sentence_transformer_device,
         )
-        .shuffle(args.shuffle_buffer)
-        .decode("pilrgb")
-        .to_tuple("jpg", "json")
-    )
+
+        def batched_filter_fn(batch):
+            """each sample in the batch is an undecoded dict"""
+            captions = [json.loads(sample["json"].decode("utf-8")).get("caption", "") for sample in batch]
+            keep_flags = caption_filter.filter_batch(captions)
+            return [sample for sample, passed in zip(batch, keep_flags) if passed]
+
+        dataset = dataset.listed(args.sentence_transformer_batch_size).map(batched_filter_fn).unlisted()
+
+    dataset = dataset.decode("pilrgb").to_tuple("jpg", "json")
 
     interpolation = transforms.InterpolationMode.LANCZOS
     ops = [
@@ -691,8 +778,8 @@ def train_ldm(args):
     train_loss = 0.0
     for batch in dataloader_wrapper:
         with accelerator.accumulate(diffusion_model):  # accumulate gradients diffusion_model.grad
-            pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
-            input_ids = batch["input_ids"].to(accelerator.device)
+            pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+            input_ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
 
             with accelerator.autocast():
                 latent_mean_logvar = vae._encode(pixel_values)
