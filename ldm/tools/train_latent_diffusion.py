@@ -33,6 +33,7 @@ from huggingface_hub import hf_hub_download
 
 from ldm.tools.filter_dataset import CaptionFilter
 from ldm.unet import UNet
+from ldm.utils import get_cosine_schedule_with_warmup_then_constant
 
 
 def parse_args():
@@ -189,6 +190,7 @@ def parse_args():
             "polynomial",
             "constant",
             "constant_with_warmup",
+            "cosine_with_warmup_then_constant",
         ],
         help="LR scheduler type.",
     )
@@ -198,6 +200,13 @@ def parse_args():
         type=int,
         required=True,
         help="Total optimization steps to perform (mandatory with WebDataset).",
+    )
+    parser.add_argument(
+        "--lr_constant_steps",
+        type=int,
+        required=True,
+        help="Number of steps to hold the learning rate at max after warmup. "
+        "Only relevant for cosine_with_warmup_then_constant scheduler.",
     )
 
     # --- advanced features -------------------------------------------------- #
@@ -665,6 +674,9 @@ def train_ldm(args):
             diffusion_model = UNet(in_channels=vae.config.latent_channels)
         else:
             raise ValueError(f"Unknown diffusion model: {args.diffusion_model}")
+    import ipdb
+
+    ipdb.set_trace()
     diffusion_model.to(memory_format=torch.channels_last)
 
     if args.hf_scheduler_repo_id:
@@ -705,12 +717,21 @@ def train_ldm(args):
     )
 
     # LR scheduler
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
+    if args.lr_scheduler == "cosine_with_warmup_then_constant":
+        lr_scheduler = get_cosine_schedule_with_warmup_then_constant(
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps,
+            num_training_steps=args.max_train_steps,
+            num_constant_steps=args.lr_constant_steps,
+            last_epoch=-1,
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps,
+            num_training_steps=args.max_train_steps,
+        )
 
     # Data
     dataset = build_webdataset(args, tokenizer)

@@ -69,25 +69,104 @@ VALIDATION_PROMPTS=(
 # --validation_prompts "${VALIDATION_PROMPTS[@]}" \
 # --generations_per_val_prompt 3 \
 # --text_conditioning_dropout 0.1 \
-# --resume_from_checkpoint /media/bryan/ssd01/expr/latent_diffusion/bs84_500k/run01/checkpoints/checkpoint_100000
+# --seed 42
 
 # --output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs252_200k \
 
 # export TORCH_LOGS="all"
+# accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
+# --output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs250_200k \
+# --pretrained_clip $CLIP_MODEL \
+# --hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
+# --hf_model_subfolder "unet" \
+# --hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
+# --hf_scheduler_subfolder "scheduler" \
+# --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
+# --enable_torch_compile --use_8bit_adam \
+# --train_batch_size 50 \
+# --gradient_accumulation_steps 5 \
+# --lr_warmup_steps 10000 \
+# --max_train_steps 200000 \
+# --checkpointing_steps 1000 \
+# --mixed_precision bf16 \
+# --dataloader_num_workers 2 \
+# --noise_offset 0.1 \
+# --validation_steps 1000 \
+# --validation_prompts "${VALIDATION_PROMPTS[@]}" \
+# --generations_per_val_prompt 3 \
+# --text_conditioning_dropout 0.1 \
+# --seed 42 \
+# --resume_from_checkpoint latest
+
+
+# DATASET_TAR_SPECS=(
+# "/media/bryan/nvme2/data/laion2b-aesthetic-square-256/{00000..00001}.tar"
+# "/media/bryan/nvme2/data/laion2b-aesthetic-square-plus54-256/00000.tar"
+# "/media/bryan/nvme2/data/laion-pop-256/{00000..00004}.tar"
+# )
+# CAPTION_FILTERS=(
+# "an outdoor scene in nature, like a beach, forest, mountain, river, or grassy field"
+# )
+# VALIDATION_PROMPTS=(
+# "A stunning lakeside scene features crystal-clear turquoise water in the foreground, revealing smooth stones beneath the surface. Pine trees and large boulders line the shore, their reflections mirrored on the water. In the distance, snow-capped mountains rise beneath a vibrant blue sky scattered with soft, wispy clouds. The setting is serene, evoking a sense of natural tranquility."
+# )
+# export TORCH_LOGS="all"
+# rm -rf /media/bryan/ssd01/expr/latent_diffusion/train_nature/ldm_bs250_100k
+# accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
+# --output_dir /media/bryan/ssd01/expr/latent_diffusion/train_nature/ldm_bs250_100k \
+# --pretrained_clip $CLIP_MODEL \
+# --hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
+# --hf_model_subfolder "unet" \
+# --hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
+# --hf_scheduler_subfolder "scheduler" \
+# --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
+# --enable_torch_compile --use_8bit_adam \
+# --train_batch_size 50 \
+# --gradient_accumulation_steps 5 \
+# --lr_warmup_steps 10000 \
+# --max_train_steps 200000 \
+# --checkpointing_steps 1000 \
+# --mixed_precision bf16 \
+# --dataloader_num_workers 2 \
+# --noise_offset 0.1 \
+# --validation_steps 1000 \
+# --validation_prompts "${VALIDATION_PROMPTS[@]}" \
+# --generations_per_val_prompt 3 \
+# --text_conditioning_dropout 0.1 \
+# --seed 42 \
+# --caption_filters "${CAPTION_FILTERS[@]}" \
+# --caption_filter_thresholds 0.4 \
+# --sentence_transformer_batch_size 1000
+
+
+VALIDATION_PROMPTS=(
+"A woman with a fair complexion and light eyes wears subtle makeup that enhances her natural features. Her hair is styled in a low updo, with soft curls framing her face. She has a calm, confident expression and slightly tilted head, adding to her graceful and composed appearance."
+"A stunning lakeside scene features crystal-clear turquoise water in the foreground, revealing smooth stones beneath the surface. Pine trees and large boulders line the shore, their reflections mirrored on the water. In the distance, snow-capped mountains rise beneath a vibrant blue sky scattered with soft, wispy clouds. The setting is serene, evoking a sense of natural tranquility."
+"A misty pine forest at sunrise, with golden light piercing through the trees and a deer grazing near a moss-covered rock."
+"A narrow desert canyon at noon, red sandstone walls casting sharp shadows and a lone hawk soaring overhead."
+"A minimalist workspace features a sleek monitor displaying a colorful macOS wallpaper, mounted above a wooden desk. A silver Mac mini stands vertically beside it. The setup includes a white Apple keyboard, wireless mouse on a dark desk mat, a black notebook, and two small potted plants. A candle adds warmth, with natural light streaming through a nearby window."
+"A two-story suburban house with a red door, kids playing on the front lawn, and mailboxes lining a quiet residential street."
+"A luxurious living room with marble floors, a crystal chandelier, velvet furniture, and tall windows revealing a garden view."
+"A sleek black sports car parked under neon lights at night, its polished body reflecting city skyscrapers in the background."
+"A delicious cheeseburger stacked with two juicy beef patties, melted cheddar cheese, caramelized onions, and creamy sauce under a soft golden bun. Fresh lettuce, a thick tomato slice, and pickles sit beneath the patties, all layered on a toasted bottom bun. The burger is presented against a plain white background, highlighting its fresh and savory ingredients."
+)
+
+export TORCH_LOGS="all"
 accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusion.py \
---output_dir /media/bryan/ssd01/expr/latent_diffusion/hf_bs250_200k \
+--output_dir /media/bryan/ssd01/expr/latent_diffusion/custom_UNet_bs250_cosine_100k \
 --pretrained_clip $CLIP_MODEL \
---hf_model_repo_id "CompVis/stable-diffusion-v1-4" \
---hf_model_subfolder "unet" \
 --hf_scheduler_repo_id "CompVis/stable-diffusion-v1-4" \
 --hf_scheduler_subfolder "scheduler" \
 --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
 --enable_torch_compile --use_8bit_adam \
---train_batch_size 50 \
+--train_batch_size 250 \
 --gradient_accumulation_steps 5 \
 --lr_warmup_steps 10000 \
---max_train_steps 200000 \
+--max_train_steps 100000 \
+--lr_constant_steps 60000 \
+--lr_scheduler cosine_with_warmup_then_constant \
 --checkpointing_steps 1000 \
+--milestone_checkpoints 10000 50000 60000 \
 --mixed_precision bf16 \
 --dataloader_num_workers 2 \
 --noise_offset 0.1 \
@@ -95,5 +174,5 @@ accelerate launch --gpu_ids 0, --num_processes 1 ldm/tools/train_latent_diffusio
 --validation_prompts "${VALIDATION_PROMPTS[@]}" \
 --generations_per_val_prompt 3 \
 --text_conditioning_dropout 0.1 \
---seed 42 \
---resume_from_checkpoint latest
+--seed 42
+# --resume_from_checkpoint latest

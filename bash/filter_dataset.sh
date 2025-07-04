@@ -11,14 +11,17 @@ DATASET_TAR_SPECS=(
 "/media/bryan/nvme2/data/laion2b-woman-256/00000.tar"
 )
 
+# "a photo of a forest" \
+# "a photo of a mountain" \
+# "a photo of the beach" \
+# "a photo taken in nature" \
+# "an outdoor landscape scene" \
+
 python ldm/tools/filter_dataset.py \
+--device cuda \
 --dataset_tar_specs "${DATASET_TAR_SPECS[@]}" \
 --caption_filters \
-"a photo of a forest" \
-"a photo of a mountain" \
-"a photo of the beach" \
-"a photo taken in nature" \
-"an outdoor landscape scene" \
---caption_filter_thresholds 0.3 \
---save_sample_images 25 \
+"an outdoor scene in nature, like a beach, forest, mountain, river, or grassy field" \
+--caption_filter_thresholds 0.4 \
+--save_sample_images 100 \
 --output_dir /media/bryan/ssd01/expr/latent_diffusion/filter_dataset/nature
