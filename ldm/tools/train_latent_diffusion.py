@@ -6,6 +6,7 @@ from typing import Optional
 import inspect
 import json
 from PIL import Image
+import shutil
 
 
 import torch
@@ -31,6 +32,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from huggingface_hub import hf_hub_download
 
 from ldm.tools.filter_dataset import CaptionFilter
+from ldm.unet import UNet
 
 
 def parse_args():
@@ -54,9 +56,9 @@ def parse_args():
     parser.add_argument(
         "--diffusion_model",
         type=str,
-        default="unet",
+        default="UNet",
         choices=[
-            "unet",
+            "UNet",
         ],
         help="Name of the diffusion_model model to use. ",
     )
@@ -233,6 +235,9 @@ def parse_args():
 
     # --- misc / logging / checkpoints -------------------------------------- #
     parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save every N steps.")
+    parser.add_argument(
+        "--milestone_checkpoints", type=int, nargs="*", default=[], help="Save checkpoints at these steps."
+    )
     parser.add_argument(
         "--checkpoint_total_limit",
         type=int,
@@ -649,13 +654,17 @@ def train_ldm(args):
     vae.to(memory_format=torch.channels_last)
     vae = torch.compile(vae, backend="inductor", mode="max-autotune", fullgraph=True)
 
+    is_hf_diffusion_model = bool(args.hf_model_repo_id)
     if args.hf_model_repo_id:
         diffusion_model = load_hf_model_from_config(
             repo_id=args.hf_model_repo_id,
             subfolder=args.hf_model_subfolder,
         )
     else:
-        raise NotImplementedError("Loading custom diffusion models is not implemented yet.")
+        if args.diffusion_model == "UNet":
+            diffusion_model = UNet(in_channels=vae.config.latent_channels)
+        else:
+            raise ValueError(f"Unknown diffusion model: {args.diffusion_model}")
     diffusion_model.to(memory_format=torch.channels_last)
 
     if args.hf_scheduler_repo_id:
@@ -667,7 +676,7 @@ def train_ldm(args):
         raise NotImplementedError("Loading custom diffusion schedulers is not implemented yet.")
 
     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-    if args.enable_xformers_memory_efficient_attention:
+    if is_hf_diffusion_model and args.enable_xformers_memory_efficient_attention:
         assert args.enable_torch_compile is False, "xformers and torch.compile are not compatible yet."
         diffusion_model.enable_xformers_memory_efficient_attention()
     diffusion_model.train()
@@ -847,7 +856,10 @@ def train_ldm(args):
                     )
 
                 # the final GroupNorm converts the activations to fp32
-                pred = diffusion_model(noisy_latents.to(weight_dtype), timesteps, enc_h, return_dict=False)[0]
+                if is_hf_diffusion_model:
+                    pred = diffusion_model(noisy_latents.to(weight_dtype), timesteps, enc_h, return_dict=False)[0]
+                else:
+                    pred = diffusion_model(noisy_latents.to(weight_dtype), timesteps, enc_h)
 
             if args.snr_gamma is None:
                 loss = F.mse_loss(pred.to(torch.float32), target.to(torch.float32), reduction="mean")
@@ -890,6 +902,15 @@ def train_ldm(args):
                 # save EMA weights too
                 # torch.save(ema_diffusion_model.state_dict(), ...)
                 accelerator.print(f"Checkpoint {step} saved")
+
+            if step in args.milestone_checkpoints:
+                accelerator.project_configuration.automatic_checkpoint_naming = False
+                accelerator.project_configuration.iteration = step
+                accelerator.save_state(
+                    output_dir=os.path.join(args.output_dir, "milestone_checkpoints", f"checkpoint_{step}")
+                )
+                accelerator.project_configuration.automatic_checkpoint_naming = True
+                accelerator.print(f"Milestone Checkpoint {step} saved")
 
             # Validation
             if step > 1 and args.validation_prompts and step % args.validation_steps == 0:
