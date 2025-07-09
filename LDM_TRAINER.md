@@ -167,6 +167,9 @@ The performance is greatly improved by applying classifier-free diffusion guidan
 
 
 ### FID
+https://lightning.ai/docs/torchmetrics/stable/image/frechet_inception_distance.html
+https://en.wikipedia.org/wiki/Fr%C3%A9chet_inception_distance
+
 ### Inception Score
 
 ## LDM Training Configuration
