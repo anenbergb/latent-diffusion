@@ -2,7 +2,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from typing import Optional
+from typing import Optional, List
 import inspect
 import json
 from PIL import Image
@@ -304,6 +304,15 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument("--output_dir", type=str, default="sd-model-finetuned", help="Checkpoint / TB dir.")
+    parser.add_argument("--eval_only", action="store_true", help="Only run evaluation.")
+    parser.add_argument("--eval_seed", type=int, default=None, help="Random seed for evaluation.")
+    parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation.")
+    parser.add_argument(
+        "--eval_num_images",
+        type=int,
+        default=1000,
+        help="Total number of images to generate for computing metrics such as FID and Inception Score",
+    )
 
     args = parser.parse_args()
 
@@ -373,13 +382,18 @@ def load_hf_scheduler_from_config(
     return scheduler_class.from_config(config)
 
 
-def build_webdataset(args, tokenizer):
+def expand_dataset_tar_files(dataset_tar_specs):
     # Expand brace patterns into concrete *.tar paths
     tar_files = []
-    for spec in args.dataset_tar_specs:
+    for spec in dataset_tar_specs:
         tar_files.extend(braceexpand(spec))
     if not tar_files:
         raise FileNotFoundError("No tar files resolved from --dataset_tar_specs")
+    return tar_files
+
+
+def build_webdataset(args, tokenizer):
+    tar_files = expand_dataset_tar_files(args.dataset_tar_specs)
 
     logging.info(f"Found {len(tar_files)} tar files to load for training.")
 
@@ -492,7 +506,7 @@ def generate(
     vae,
     diffusion_model,
     noise_scheduler,
-    prompt: str,
+    prompts: List[str],
     num_inference_steps: int = 50,
     guidance_scale: float = 7.5,
     height: int = 256,
@@ -505,7 +519,7 @@ def generate(
 ) -> Image.Image:
     # Prompt -> embeddings (classifier-free guidance = cond + uncond)
     text_inputs = tokenizer(
-        [prompt], max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
     ).input_ids.to(device=device)
 
     uncond_inputs = tokenizer(
@@ -514,6 +528,9 @@ def generate(
 
     text_embeds = text_encoder(text_inputs, return_dict=False)[0].to(dtype=weight_dtype)
     uncond_embeds = text_encoder(uncond_inputs, return_dict=False)[0].to(dtype=weight_dtype)
+    import ipdb
+
+    ipdb.set_trace()
     embeds = torch.cat([uncond_embeds, text_embeds], dim=0)  # (2, T, 768)
 
     noise_scheduler.set_timesteps(num_inference_steps, device=device)
@@ -617,6 +634,104 @@ def log_validation_prompts(
         accelerator.log({f"val_prompt_{i}": prompt})
 
 
+def build_validation_webdataset(args, tokenizer):
+    tar_files = expand_dataset_tar_files(args.dataset_tar_specs)
+    dataset = (
+        wds.WebDataset(
+            tar_files,
+            repeat=False,
+            shardshuffle=len(tar_files),
+            detshuffle=True,
+            seed=args.eval_seed,
+        )
+        .shuffle(args.shuffle_buffer)
+        .decode("pilrgb")
+        .to_tuple("jpg", "json")
+    )
+    # TODO: Add caption filtering
+
+    interpolation = transforms.InterpolationMode.LANCZOS
+    ops = [
+        transforms.ToImage(),  # Convert PIL image to torchvision.tv_tensors.Image
+        transforms.ToDtype(torch.uint8, scale=True),
+    ]
+    if args.resize:
+        ops.append(transforms.Resize(args.resolution, interpolation=interpolation))
+    ops.extend(
+        [
+            transforms.CenterCrop(args.resolution),
+            transforms.ToDtype(torch.float32, scale=True),
+            transforms.Normalize([0.5], [0.5]),  # hard-coded to mean=std=0.5 due to VAE
+        ]
+    )
+    tx = transforms.Compose(ops)
+
+    def _map(sample):
+        # input longer than 'max_model_length' (77) get truncated
+        # input shorter than 'max_model_length' get padded
+        img, meta = sample
+        return {
+            "pixel_values": tx(img),
+            "caption": meta.get("caption", "An image."),
+        }
+
+    return dataset.map(_map)
+
+
+def eval_collate_fn(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    captions = [b["caption"] for b in batch]
+    return {"pixel_values": pixel_values, "captions": captions}
+
+
+def run_evaluation(
+    args,
+    tokenizer,
+    text_encoder,
+    vae,
+    diffusion_model,
+    noise_scheduler,
+    accelerator,
+    weight_dtype: torch.dtype = torch.float32,
+    is_hf_diffusion_model: bool = False,
+):
+    dataset = build_validation_webdataset(args, tokenizer)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,  # handled by webdataset
+        num_workers=args.dataloader_num_workers,
+        collate_fn=eval_collate_fn,
+        pin_memory=True,
+        drop_last=False,
+    )
+    progress_bar = tqdm(range(0, args.eval_num_images), desc="Evaluation")
+    count = 0
+    for batch in dataloader:
+        real_images = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
+        captions = batch["captions"]
+        fake_images = generate(
+            tokenizer,
+            text_encoder,
+            vae,
+            diffusion_model,
+            noise_scheduler,
+            prompts=captions,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.classifier_free_guidance_scale,
+            height=args.resolution,
+            width=args.resolution,
+            seed=args.eval_seed,
+            device=accelerator.device,
+            return_type="torch",
+            is_hf_diffusion_model=is_hf_diffusion_model,
+        )
+        count += len(real_images)
+        if count >= args.eval_num_images:
+            break
+    return
+
+
 def train_ldm(args):
     # Seed / dirs
     if args.seed is not None:
@@ -651,14 +766,15 @@ def train_ldm(args):
     # https://huggingface.co/docs/accelerate/en/concept_guides/gradient_synchronization
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
-        log_with="tensorboard",
+        log_with=None if args.eval_only else "tensorboard",
         project_config=proj_cfg,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         split_batches=False,
         step_scheduler_with_optimizer=False,
         dynamo_plugin=dynamo_plugin if args.enable_torch_compile else None,
     )
-    accelerator.init_trackers(os.path.basename(args.output_dir))
+    if not args.eval_only:
+        accelerator.init_trackers(os.path.basename(args.output_dir))
 
     # Models
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_clip)
@@ -760,11 +876,6 @@ def train_ldm(args):
     if args.use_ema:
         ema_diffusion_model.to(accelerator.device)
 
-    accelerator.print("Running training")
-    accelerator.print(f"  Batch size = {args.train_batch_size}")
-    accelerator.print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    accelerator.print(f"  Total optimization steps = {args.max_train_steps}")
-
     if args.resume_from_checkpoint:
         path = args.resume_from_checkpoint
         if args.resume_from_checkpoint == "latest":
@@ -791,6 +902,29 @@ def train_ldm(args):
             accelerator.print(f"Resuming training from step {start_step}")
     else:
         start_step = 0
+
+    if args.eval_only:
+        accelerator.print("Running Evaluation Only")
+        accelerator.print(f"  Batch size = {args.eval_batch_size}")
+        accelerator.print(f"  Number of Images = {args.eval_num_images}")
+        run_evaluation(
+            args,
+            tokenizer,
+            text_encoder,
+            vae,
+            diffusion_model,
+            noise_scheduler,
+            accelerator,
+            weight_dtype=weight_dtype,
+            is_hf_diffusion_model=is_hf_diffusion_model,
+        )
+        accelerator.end_training()
+        return 0
+
+    accelerator.print("Running training")
+    accelerator.print(f"  Batch size = {args.train_batch_size}")
+    accelerator.print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    accelerator.print(f"  Total optimization steps = {args.max_train_steps}")
 
     log_validation_prompts(accelerator, args.validation_prompts)
 
