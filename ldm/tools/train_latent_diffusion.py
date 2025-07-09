@@ -34,6 +34,7 @@ from huggingface_hub import hf_hub_download
 from ldm.tools.filter_dataset import CaptionFilter
 from ldm.unet import UNet
 from ldm.utils import get_cosine_schedule_with_warmup_then_constant
+from ldm.metrics import ImageQualityMetrics
 
 
 def parse_args():
@@ -517,6 +518,8 @@ def generate(
     return_type: str = "pil",
     is_hf_diffusion_model: bool = False,
 ) -> Image.Image:
+    assert return_type in ("torch", "pil")
+    batch_size = len(prompts)
     # Prompt -> embeddings (classifier-free guidance = cond + uncond)
     text_inputs = tokenizer(
         prompts, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
@@ -526,12 +529,10 @@ def generate(
         [""], max_length=tokenizer.model_max_length, padding="max_length", return_tensors="pt"
     ).input_ids.to(device=device)
 
-    text_embeds = text_encoder(text_inputs, return_dict=False)[0].to(dtype=weight_dtype)
-    uncond_embeds = text_encoder(uncond_inputs, return_dict=False)[0].to(dtype=weight_dtype)
-    import ipdb
-
-    ipdb.set_trace()
-    embeds = torch.cat([uncond_embeds, text_embeds], dim=0)  # (2, T, 768)
+    text_embeds = text_encoder(text_inputs, return_dict=False)[0].to(dtype=weight_dtype)  # (N,77,768)
+    uncond_embeds = text_encoder(uncond_inputs, return_dict=False)[0].to(dtype=weight_dtype)  # (1,77,768)
+    uncond_embeds = uncond_embeds.expand(batch_size, -1, -1)  # doesn't copy, only broadcasts
+    embeds = torch.cat([uncond_embeds, text_embeds], dim=0)  # (2N, T, 768)
 
     noise_scheduler.set_timesteps(num_inference_steps, device=device)
 
@@ -541,17 +542,17 @@ def generate(
     latent_channels = vae.config.latent_channels
     latent_downscale = get_vae_downscale(vae.config)  # 8
     latents = torch.randn(
-        (1, latent_channels, height // latent_downscale, width // latent_downscale),
+        (batch_size, latent_channels, height // latent_downscale, width // latent_downscale),
         generator=gen,
         device=device,
         dtype=weight_dtype,
-    )  # (1,4,32,32)
+    )  # (N,4,32,32)
     latents *= noise_scheduler.init_noise_sigma  # match training scale
 
     # Diffusion (reverse) loop
     for timestep in noise_scheduler.timesteps:
         # Duplicate for (uncond, cond) batches
-        latent_in = torch.cat([latents] * 2, dim=0)  # (2,4,32,32)
+        latent_in = torch.cat([latents, latents], dim=0)  # (2,4,32,32)
         latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
 
         if is_hf_diffusion_model:
@@ -568,17 +569,20 @@ def generate(
 
     # Latents -> image space through VAE decoder
     latents = latents / vae.config.scaling_factor  # SD latent scaling
-    image = vae.decode(latents, return_dict=False)[0]
+    image_tensor = vae.decode(latents, return_dict=False)[0]
 
     # Post-process [-1,1] -> [0,1] -> [0,255]
-    image = (image / 2 + 0.5).clamp(0, 1)
-    image = (255 * image.to(device="cpu")).to(torch.uint8).squeeze(0)
+    image_tensor = (image_tensor / 2 + 0.5).clamp(0, 1)
+    image_tensor = (255 * image_tensor).to(torch.uint8)
     if return_type == "pil":
-        return Image.fromarray(image.permute(1, 2, 0).numpy())
-    return image
+        # (N,3,256,256) -> (N,256,256,3)
+        images_numpy = image_tensor.to(device="cpu").permute(0, 2, 3, 1).numpy()
+        images = [Image.fromarray(x) for x in images_numpy]
+        return images
+    return image_tensor
 
 
-def log_validation(
+def log_validation_images(
     tokenizer,
     text_encoder,
     vae,
@@ -587,6 +591,7 @@ def log_validation(
     args,
     accelerator,
     train_step,
+    weight_dtype: torch.dtype = torch.bfloat16,
     is_hf_diffusion_model: bool = False,
 ):
     accelerator.print(f"Running validation at step {train_step}...")
@@ -608,9 +613,10 @@ def log_validation(
                     width=args.resolution,
                     seed=args.seed + i if args.seed is not None else None,
                     device=accelerator.device,
+                    weight_dtype=weight_dtype,
                     return_type="torch",
                     is_hf_diffusion_model=is_hf_diffusion_model,
-                )
+                )[0].to(device="cpu")
                 images.append(image)
 
     nrow = args.generations_per_val_prompt if args.generations_per_val_prompt > 1 else 3
@@ -660,8 +666,6 @@ def build_validation_webdataset(args, tokenizer):
     ops.extend(
         [
             transforms.CenterCrop(args.resolution),
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize([0.5], [0.5]),  # hard-coded to mean=std=0.5 due to VAE
         ]
     )
     tx = transforms.Compose(ops)
@@ -692,7 +696,7 @@ def run_evaluation(
     diffusion_model,
     noise_scheduler,
     accelerator,
-    weight_dtype: torch.dtype = torch.float32,
+    weight_dtype: torch.dtype = torch.bfloat16,
     is_hf_diffusion_model: bool = False,
 ):
     dataset = build_validation_webdataset(args, tokenizer)
@@ -705,31 +709,40 @@ def run_evaluation(
         pin_memory=True,
         drop_last=False,
     )
+
+    metrics = ImageQualityMetrics(device=accelerator.device)
     progress_bar = tqdm(range(0, args.eval_num_images), desc="Evaluation")
     count = 0
     for batch in dataloader:
-        real_images = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype, non_blocking=True)
         captions = batch["captions"]
-        fake_images = generate(
-            tokenizer,
-            text_encoder,
-            vae,
-            diffusion_model,
-            noise_scheduler,
-            prompts=captions,
-            num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.classifier_free_guidance_scale,
-            height=args.resolution,
-            width=args.resolution,
-            seed=args.eval_seed,
-            device=accelerator.device,
-            return_type="torch",
-            is_hf_diffusion_model=is_hf_diffusion_model,
-        )
+        with accelerator.autocast():
+            fake_images = generate(
+                tokenizer,
+                text_encoder,
+                vae,
+                diffusion_model,
+                noise_scheduler,
+                prompts=captions,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.classifier_free_guidance_scale,
+                height=args.resolution,
+                width=args.resolution,
+                seed=args.eval_seed,
+                device=accelerator.device,
+                weight_dtype=weight_dtype,
+                return_type="torch",
+                is_hf_diffusion_model=is_hf_diffusion_model,
+            )
+        real_images = batch["pixel_values"]
+
+        metrics.update(real=real_images, fake=fake_images)
+        progress_bar.update(len(real_images))
         count += len(real_images)
         if count >= args.eval_num_images:
             break
-    return
+
+    stats = metrics.compute()
+    return stats
 
 
 def train_ldm(args):
@@ -907,7 +920,7 @@ def train_ldm(args):
         accelerator.print("Running Evaluation Only")
         accelerator.print(f"  Batch size = {args.eval_batch_size}")
         accelerator.print(f"  Number of Images = {args.eval_num_images}")
-        run_evaluation(
+        metrics = run_evaluation(
             args,
             tokenizer,
             text_encoder,
@@ -918,6 +931,10 @@ def train_ldm(args):
             weight_dtype=weight_dtype,
             is_hf_diffusion_model=is_hf_diffusion_model,
         )
+        accelerator.print("Evaluation Metrics Results")
+        for name, val in metrics.items():
+            accelerator.print(f"  {name}: {val:.4f}")
+
         accelerator.end_training()
         return 0
 
@@ -1077,7 +1094,7 @@ def train_ldm(args):
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_diffusion_model.store(diffusion_model.parameters())
                     ema_diffusion_model.copy_to(diffusion_model.parameters())
-                log_validation(
+                log_validation_images(
                     tokenizer,
                     text_encoder,
                     vae,
@@ -1086,6 +1103,7 @@ def train_ldm(args):
                     args,
                     accelerator,
                     step,
+                    weight_dtype=weight_dtype,
                     is_hf_diffusion_model=is_hf_diffusion_model,
                 )
                 if args.use_ema:
