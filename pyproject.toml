@@ -32,6 +32,8 @@ dependencies = [
     "taming_transformers",
     "img2dataset",
     "sentence_transformers",
+    "torch-fidelity",
+    "torchmetrics[image]",
 ]
 
 [project.optional-dependencies]

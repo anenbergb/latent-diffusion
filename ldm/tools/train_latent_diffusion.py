@@ -7,6 +7,8 @@ import inspect
 import json
 from PIL import Image
 import shutil
+import numpy as np
+import random
 
 
 import torch
@@ -205,7 +207,8 @@ def parse_args():
     parser.add_argument(
         "--lr_constant_steps",
         type=int,
-        required=True,
+        default=100,
+        required=False,
         help="Number of steps to hold the learning rate at max after warmup. "
         "Only relevant for cosine_with_warmup_then_constant scheduler.",
     )
@@ -307,12 +310,28 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="sd-model-finetuned", help="Checkpoint / TB dir.")
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation.")
     parser.add_argument("--eval_seed", type=int, default=None, help="Random seed for evaluation.")
-    parser.add_argument("--eval_batch_size", type=int, default=16, help="Batch size for evaluation.")
+    parser.add_argument("--eval_batch_size", type=int, default=25, help="Batch size for evaluation.")
     parser.add_argument(
         "--eval_num_images",
         type=int,
         default=1000,
         help="Total number of images to generate for computing metrics such as FID and Inception Score",
+    )
+    parser.add_argument(
+        "--final_eval_num_images",
+        type=int,
+        default=5000,
+        help="Sampling more images improves the stability of the FID and Inception Score but is much slower. "
+        "This argument will be used to specify the number of images to generate --eval_only and after training "
+        "completion.",
+    )
+    parser.add_argument(
+        "--eval_dataset_tar_specs",
+        type=str,
+        nargs="+",
+        required=False,
+        default=None,
+        help="Brace-expandable TAR shard specs (e.g. '/data/laion/{00000..09999}.tar /data/extra/00000.tar').",
     )
 
     args = parser.parse_args()
@@ -331,6 +350,11 @@ def parse_args():
                 f"number of thresholds ({len(args.caption_filter_thresholds)}), "
                 f"or provide exactly one threshold to apply to all filters"
             )
+    if args.eval_dataset_tar_specs is None:
+        args.eval_dataset_tar_specs = args.dataset_tar_specs
+
+    args.final_eval_num_images = max(args.final_eval_num_images, args.eval_num_images)
+
     return args
 
 
@@ -406,7 +430,7 @@ def build_webdataset(args, tokenizer):
         shardshuffle=len(tar_files),
         detshuffle=True,
         seed=args.seed,
-    ).shuffle(args.shuffle_buffer)
+    ).shuffle(args.shuffle_buffer, seed=args.seed)
 
     if args.caption_filters:
         caption_filter = CaptionFilter(
@@ -583,12 +607,12 @@ def generate(
 
 
 def log_validation_images(
+    args,
     tokenizer,
     text_encoder,
     vae,
     diffusion_model,
     noise_scheduler,
-    args,
     accelerator,
     train_step,
     weight_dtype: torch.dtype = torch.bfloat16,
@@ -606,7 +630,7 @@ def log_validation_images(
                     vae,
                     diffusion_model,
                     noise_scheduler,
-                    prompt=prompt,
+                    prompts=[prompt],
                     num_inference_steps=args.num_inference_steps,
                     guidance_scale=args.classifier_free_guidance_scale,
                     height=args.resolution,
@@ -622,7 +646,8 @@ def log_validation_images(
     nrow = args.generations_per_val_prompt if args.generations_per_val_prompt > 1 else 3
     image_grid = make_grid(images, nrow=nrow, padding=0, value_range=(0, 255))  # (C,H,W)
     image_grid_pil = Image.fromarray(image_grid.permute(1, 2, 0).numpy())
-    image_grid_pil.save(Path(args.output_dir) / f"val_images_step_{train_step}.png")
+    os.makedirs(os.path.join(args.output_dir, "val_images"), exist_ok=True)
+    image_grid_pil.save(os.path.join(args.output_dir, "val_images", "val_images_step_{train_step}.png"))
     tracker = accelerator.get_tracker("tensorboard")
     tracker.log_images({"validation": image_grid}, train_step, dataformats="CHW")
     torch.cuda.empty_cache()
@@ -640,8 +665,14 @@ def log_validation_prompts(
         accelerator.log({f"val_prompt_{i}": prompt})
 
 
-def build_validation_webdataset(args, tokenizer):
-    tar_files = expand_dataset_tar_files(args.dataset_tar_specs)
+def eval_collate_fn(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    captions = [b["caption"] for b in batch]
+    return {"pixel_values": pixel_values, "captions": captions}
+
+
+def build_validation_dataloader(args):
+    tar_files = expand_dataset_tar_files(args.eval_dataset_tar_specs)
     dataset = (
         wds.WebDataset(
             tar_files,
@@ -650,7 +681,7 @@ def build_validation_webdataset(args, tokenizer):
             detshuffle=True,
             seed=args.eval_seed,
         )
-        .shuffle(args.shuffle_buffer)
+        .shuffle(args.shuffle_buffer, seed=args.eval_seed)
         .decode("pilrgb")
         .to_tuple("jpg", "json")
     )
@@ -679,13 +710,24 @@ def build_validation_webdataset(args, tokenizer):
             "caption": meta.get("caption", "An image."),
         }
 
-    return dataset.map(_map)
+    dataset = dataset.map(_map)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,  # handled by webdataset
+        num_workers=0,  # force deterministic sample order
+        collate_fn=eval_collate_fn,
+        pin_memory=True,
+        drop_last=False,
+    )
+    return dataloader
 
 
-def eval_collate_fn(batch):
-    pixel_values = torch.stack([b["pixel_values"] for b in batch])
-    captions = [b["caption"] for b in batch]
-    return {"pixel_values": pixel_values, "captions": captions}
+def accelerate_has_tracker(accelerator, name="tensorboard"):
+    for tracker in accelerator.trackers:
+        if tracker.name == name:
+            return True
+    return False
 
 
 def run_evaluation(
@@ -698,22 +740,32 @@ def run_evaluation(
     accelerator,
     weight_dtype: torch.dtype = torch.bfloat16,
     is_hf_diffusion_model: bool = False,
+    save_images: bool = False,
+    train_step: Optional[int] = None,
+    num_images: int = 1000,
 ):
-    dataset = build_validation_webdataset(args, tokenizer)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.eval_batch_size,
-        shuffle=False,  # handled by webdataset
-        num_workers=args.dataloader_num_workers,
-        collate_fn=eval_collate_fn,
-        pin_memory=True,
-        drop_last=False,
-    )
+    save_dir = os.path.join(args.output_dir, "random_eval_images")
+    if save_images:
+        os.makedirs(save_dir, exist_ok=True)
 
+    def run_save_images(images, name="generated", nrow=5):
+        image_grid = make_grid(images.to(device="cpu"), nrow=nrow, padding=0, value_range=(0, 255))
+        image_grid_pil = Image.fromarray(image_grid.permute(1, 2, 0).numpy())
+
+        suffix = f"_{train_step}" if train_step is not None else ""
+        filename = f"{name}{suffix}.png"
+        image_grid_pil.save(os.path.join(save_dir, filename))
+
+        if accelerate_has_tracker(accelerator, "tensorboard") and train_step is not None:
+            tracker = accelerator.get_tracker("tensorboard")
+            tracker.log_images({f"random_eval_{name}": image_grid}, train_step, dataformats="CHW")
+
+    diffusion_model.eval()
+    dataloader = build_validation_dataloader(args)
     metrics = ImageQualityMetrics(device=accelerator.device)
-    progress_bar = tqdm(range(0, args.eval_num_images), desc="Evaluation")
+    progress_bar = tqdm(range(0, num_images), desc="Evaluation")
     count = 0
-    for batch in dataloader:
+    for i, batch in enumerate(dataloader):
         captions = batch["captions"]
         with accelerator.autocast():
             fake_images = generate(
@@ -734,14 +786,24 @@ def run_evaluation(
                 is_hf_diffusion_model=is_hf_diffusion_model,
             )
         real_images = batch["pixel_values"]
+        if i == 0 and save_images:
+            run_save_images(fake_images, "generated_images")
+            # the real-images are always the same because the dataloader loads images in a
+            # deterministic order. real-images only need to be saved for the first iteration.
+            if train_step is None or train_step == args.validation_steps:
+                run_save_images(real_images, "real_images")
 
         metrics.update(real=real_images, fake=fake_images)
         progress_bar.update(len(real_images))
         count += len(real_images)
-        if count >= args.eval_num_images:
+        if count >= num_images:
             break
-
     stats = metrics.compute()
+    if train_step is not None:
+        accelerator.log(stats, step=train_step)
+
+    diffusion_model.train()
+    torch.cuda.empty_cache()
     return stats
 
 
@@ -930,8 +992,10 @@ def train_ldm(args):
             accelerator,
             weight_dtype=weight_dtype,
             is_hf_diffusion_model=is_hf_diffusion_model,
+            save_images=True,
+            num_images=args.final_eval_num_images,
         )
-        accelerator.print("Evaluation Metrics Results")
+        accelerator.print("Evaluation Metrics")
         for name, val in metrics.items():
             accelerator.print(f"  {name}: {val:.4f}")
 
@@ -1095,25 +1159,53 @@ def train_ldm(args):
                     ema_diffusion_model.store(diffusion_model.parameters())
                     ema_diffusion_model.copy_to(diffusion_model.parameters())
                 log_validation_images(
+                    args,
                     tokenizer,
                     text_encoder,
                     vae,
                     diffusion_model,
                     noise_scheduler,
-                    args,
                     accelerator,
                     step,
                     weight_dtype=weight_dtype,
                     is_hf_diffusion_model=is_hf_diffusion_model,
                 )
+                metrics = run_evaluation(
+                    args,
+                    tokenizer,
+                    text_encoder,
+                    vae,
+                    diffusion_model,
+                    noise_scheduler,
+                    accelerator,
+                    weight_dtype=weight_dtype,
+                    is_hf_diffusion_model=is_hf_diffusion_model,
+                    save_images=True,
+                    train_step=step,
+                    num_images=args.eval_num_images,
+                )
+                accelerator.print(f"Evaluation Metrics at iteration {step}")
+                for name, val in metrics.items():
+                    accelerator.print(f"  {name}: {val:.4f}")
+
                 if args.use_ema:
                     # Switch back to the original UNet parameters
                     ema_diffusion_model.restore(diffusion_model.parameters())
 
-    # end of training loop
-    if args.use_ema:
-        diffusion_model = accelerator.unwrap_model(diffusion_model)
-        ema_diffusion_model.copy_to(diffusion_model.parameters())
+    metrics = run_evaluation(
+        args,
+        tokenizer,
+        text_encoder,
+        vae,
+        diffusion_model,
+        noise_scheduler,
+        accelerator,
+        weight_dtype=weight_dtype,
+        is_hf_diffusion_model=is_hf_diffusion_model,
+        save_images=True,
+        train_step=step,
+        num_images=args.final_eval_num_images,
+    )
 
     accelerator.end_training()
     return 0
