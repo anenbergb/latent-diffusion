@@ -981,7 +981,7 @@ def train_ldm(args):
     if args.eval_only:
         accelerator.print("Running Evaluation Only")
         accelerator.print(f"  Batch size = {args.eval_batch_size}")
-        accelerator.print(f"  Number of Images = {args.eval_num_images}")
+        accelerator.print(f"  Number of Images = {args.final_eval_num_images}")
         metrics = run_evaluation(
             args,
             tokenizer,
