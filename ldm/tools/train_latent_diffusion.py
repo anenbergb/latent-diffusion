@@ -577,7 +577,7 @@ def generate(
     for timestep in noise_scheduler.timesteps:
         # Duplicate for (uncond, cond) batches
         latent_in = torch.cat([latents, latents], dim=0)  # (2,4,32,32)
-        latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
+        latent_in = noise_scheduler.scale_model_input(latent_in, timestep) # null-op
 
         if is_hf_diffusion_model:
             noise_pred = diffusion_model(latent_in, timestep, embeds, return_dict=False)[0]
@@ -588,7 +588,6 @@ def generate(
 
         # Classifier-free guidance
         eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
         latents = noise_scheduler.step(eps, timestep, latents).prev_sample
 
     # Latents -> image space through VAE decoder
