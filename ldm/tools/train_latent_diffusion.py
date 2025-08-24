@@ -38,6 +38,8 @@ from ldm.unet import UNet
 from ldm.utils import get_cosine_schedule_with_warmup_then_constant
 from ldm.metrics import ImageQualityMetrics
 
+from ldm.scheduling_ddpm import DDPMScheduler
+
 
 def parse_args():
     parser = argparse.ArgumentParser("Latent Diffusion Trainer")
@@ -577,7 +579,7 @@ def generate(
     for timestep in noise_scheduler.timesteps:
         # Duplicate for (uncond, cond) batches
         latent_in = torch.cat([latents, latents], dim=0)  # (2,4,32,32)
-        latent_in = noise_scheduler.scale_model_input(latent_in, timestep)
+        latent_in = noise_scheduler.scale_model_input(latent_in, timestep) # null-op
 
         if is_hf_diffusion_model:
             noise_pred = diffusion_model(latent_in, timestep, embeds, return_dict=False)[0]
@@ -588,7 +590,6 @@ def generate(
 
         # Classifier-free guidance
         eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-
         latents = noise_scheduler.step(eps, timestep, latents).prev_sample
 
     # Latents -> image space through VAE decoder
@@ -879,10 +880,12 @@ def train_ldm(args):
             repo_id=args.hf_scheduler_repo_id,
             subfolder=args.hf_scheduler_subfolder,
         )
+        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+    elif args.diffusion_scheduler == "ddpm":
+        noise_scheduler = DDPMScheduler(device=torch.device("cuda"))
     else:
-        raise NotImplementedError("Loading custom diffusion schedulers is not implemented yet.")
+        raise ValueError(f"Unknown diffusion schedulers: {args.diffusion_scheduler}")
 
-    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     if is_hf_diffusion_model and args.enable_xformers_memory_efficient_attention:
         assert args.enable_torch_compile is False, "xformers and torch.compile are not compatible yet."
         diffusion_model.enable_xformers_memory_efficient_attention()
