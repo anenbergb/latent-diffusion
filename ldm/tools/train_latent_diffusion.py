@@ -38,6 +38,8 @@ from ldm.unet import UNet
 from ldm.utils import get_cosine_schedule_with_warmup_then_constant
 from ldm.metrics import ImageQualityMetrics
 
+from ldm.scheduling_ddpm import DDPMScheduler
+
 
 def parse_args():
     parser = argparse.ArgumentParser("Latent Diffusion Trainer")
@@ -878,10 +880,12 @@ def train_ldm(args):
             repo_id=args.hf_scheduler_repo_id,
             subfolder=args.hf_scheduler_subfolder,
         )
+        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+    elif args.diffusion_scheduler == "ddpm":
+        noise_scheduler = DDPMScheduler(device=torch.device("cuda"))
     else:
-        raise NotImplementedError("Loading custom diffusion schedulers is not implemented yet.")
+        raise ValueError(f"Unknown diffusion schedulers: {args.diffusion_scheduler}")
 
-    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
     if is_hf_diffusion_model and args.enable_xformers_memory_efficient_attention:
         assert args.enable_torch_compile is False, "xformers and torch.compile are not compatible yet."
         diffusion_model.enable_xformers_memory_efficient_attention()

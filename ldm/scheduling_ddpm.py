@@ -38,6 +38,7 @@ class DDPMScheduler:
         beta_schedule: str = "linear",
         timestep_spacing: str = "leading",
         steps_offset: int = 0,
+        device: torch.device = torch.device("cuda"),
     ):
         """
 
@@ -47,18 +48,21 @@ class DDPMScheduler:
                 Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.
             steps_offset: An offset added to the inference steps, as required by some model families.
         """
+        self.device = device
         self.prediction_type = "epsilon"  # "v_prediction"
 
         # inference parameters
         self.steps_offset = steps_offset
         self.timestep_spacing = timestep_spacing
         self.num_inference_steps = None
-        self.timesteps = torch.arange(0, num_train_timesteps, dtype=torch.long)[::-1]
+        self.timesteps = torch.arange(0, num_train_timesteps, dtype=torch.long).flip(0).to(device)
 
         self.init_noise_sigma = 1.0  # match training scale
 
         # Noise schedule beta and alpha values
-        self.betas = get_beta_schedule(beta_schedule, num_train_timesteps).to(dtype=torch.float32)  # (num_timesteps,)
+        self.betas = (
+            get_beta_schedule(beta_schedule, num_train_timesteps).to(dtype=torch.float32).to(device)
+        )  # (num_timesteps,)
         self.num_train_timesteps = int(self.betas.shape[0])
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)  # alpha_bar_t
@@ -78,6 +82,10 @@ class DDPMScheduler:
 
         posterior_var = self.betas * (1.0 - alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.posterior_std = torch.sqrt(posterior_var.clamp(min=1e-20))
+
+    @property
+    def config(self):
+        return self
 
     def add_noise(
         self,
@@ -132,7 +140,7 @@ class DDPMScheduler:
     def set_timesteps(
         self,
         num_inference_steps: int,
-        device: Union[str, torch.device] = None,
+        **kwargs,
     ):
         """
         set the .timesteps array from 1 to self.num_train_timesteps
@@ -157,13 +165,16 @@ class DDPMScheduler:
         # "linspace", "leading", "trailing" corresponds to annotation of Table 2. of https://arxiv.org/abs/2305.08891
         if self.timestep_spacing == "linspace":
             timesteps = (
-                torch.linspace(0, self.num_train_timesteps - 1, num_inference_steps).round()[::-1].to(dtype=torch.long)
+                torch.linspace(0, self.num_train_timesteps - 1, num_inference_steps)
+                .round()
+                .flip(0)
+                .to(dtype=torch.long)
             )
         elif self.timestep_spacing == "leading":
             step_ratio = self.num_train_timesteps // self.num_inference_steps
             # creates integer timesteps by multiplying by ratio
             # casting to int to avoid issues when num_inference_step is power of 3
-            timesteps = (torch.arange(0, num_inference_steps) * step_ratio).round()[::-1].to(dtype=torch.long)
+            timesteps = (torch.arange(0, num_inference_steps) * step_ratio).round().flip(0).to(dtype=torch.long)
             timesteps += self.steps_offset
         elif self.timestep_spacing == "trailing":
             step_ratio = self.num_train_timesteps / self.num_inference_steps
@@ -175,7 +186,7 @@ class DDPMScheduler:
             raise ValueError(
                 f"{self.timestep_spacing} is not supported. Please make sure to choose one of 'linspace', 'leading' or 'trailing'."
             )
-        self.timesteps = timesteps.to(device)
+        self.timesteps = timesteps.to(self.device)
 
     def scale_model_input(self, sample: torch.Tensor, timestep: Optional[int] = None) -> torch.Tensor:
         return sample
