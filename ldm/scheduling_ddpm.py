@@ -1,16 +1,7 @@
 import torch
 from torch import nn
-from typing import Union, Optional
 from dataclasses import dataclass
 import math
-
-"""
-{'_class_name': 'PNDMScheduler', '_diffusers_version': '0.7.0.dev0', 
-'beta_end': 0.012, 'beta_schedule': 'scaled_linear', 'beta_start': 0.00085,
-'num_train_timesteps': 1000, 'set_alpha_to_one': False,
-'skip_prk_steps': True, 'steps_offset': 1, 'trained_betas': None, 'clip_sample': False}
-
-"""
 
 
 @dataclass
@@ -28,7 +19,7 @@ class DDPMSchedulerOutput:
     """
 
     prev_sample: torch.Tensor
-    pred_original_sample: Optional[torch.Tensor] = None
+    pred_original_sample: torch.Tensor | None = None
 
 
 class DDPMScheduler:
@@ -188,7 +179,7 @@ class DDPMScheduler:
             )
         self.timesteps = timesteps.to(self.device)
 
-    def scale_model_input(self, sample: torch.Tensor, timestep: Optional[int] = None) -> torch.Tensor:
+    def scale_model_input(self, sample: torch.Tensor, timestep: int | None = None) -> torch.Tensor:
         return sample
 
     def step(
